@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 import re
 import time
+import urllib.request
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -44,6 +46,34 @@ EXPLAIN_PROMPT = """你是 Excel 公式讲解者。用中文解释给定公式�
 
 class LLMError(RuntimeError):
     """调用模型失败（网络、鉴权、返回格式非法）。"""
+
+
+# 本机代理软件的监听地址，几乎都是明文 HTTP 而非 HTTPS
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+_PROXY_HINT = (
+    "。代理不可用：请确认代理软件正在运行，或在 .env 里设置 "
+    "EXCELCR_PROXY=http://127.0.0.1:端口 指定代理，或设置 EXCELCR_TRUST_ENV=0 直连"
+)
+
+
+def normalize_proxies(raw: dict) -> dict:
+    """修正系统代理里 https:// 指向本机代理的写法。
+
+    Windows 的系统代理在注册表里只存 host:port，Python 会给 https 通道补成
+    ``https://127.0.0.1:端口``，requests 于是对本地明文代理发起 TLS 握手，
+    报出 ProxyError('Unable to connect to proxy')。这里统一降级为 http://。
+    """
+    fixed: dict = {}
+    for scheme, url in (raw or {}).items():
+        if not url or "://" not in url:
+            fixed[scheme] = url
+            continue
+        parts = urlsplit(url)
+        if parts.scheme == "https" and parts.hostname in _LOOPBACK_HOSTS:
+            parts = parts._replace(scheme="http")
+        fixed[scheme] = urlunsplit(parts)
+    return fixed
 
 
 @dataclass
@@ -87,6 +117,27 @@ class DeepSeekClient:
         self.logger = logger
         self.total_usage = Usage()
         self._session = requests.Session()
+        self._proxy_bypassed = False
+        self._configure_proxies()
+
+    def _configure_proxies(self) -> None:
+        """显式接管代理，不让 requests 直接照抄系统里写错 scheme 的代理。"""
+        if self.settings.proxy:
+            self._session.trust_env = False
+            self._session.proxies = {"http": self.settings.proxy, "https": self.settings.proxy}
+        elif not self.settings.trust_env:
+            self._bypass_proxy()
+            return
+        else:
+            self._session.proxies = normalize_proxies(urllib.request.getproxies())
+        if self.logger and self._session.proxies:
+            self.logger.info("使用代理 %s", self._session.proxies.get("https") or "系统代理")
+
+    def _bypass_proxy(self) -> None:
+        """放弃代理改直连（DeepSeek 接口在国内可直连）。"""
+        self._proxy_bypassed = True
+        self._session.trust_env = False
+        self._session.proxies = {}
 
     def chat(self, messages: list[dict], *, json_mode: bool = True, max_tokens: int = 800) -> ChatResult:
         api_key = self.settings.require_api_key()
@@ -111,7 +162,9 @@ class DeepSeekClient:
             )
 
         last_error: Exception | None = None
-        for attempt in range(1, 3):  # 网络层重试，与"公式修复重试"是两件事
+        attempt, max_attempts = 0, 2  # 网络层重试，与"公式修复重试"是两件事
+        while attempt < max_attempts:
+            attempt += 1
             started = time.perf_counter()
             try:
                 response = self._session.post(
@@ -124,6 +177,13 @@ class DeepSeekClient:
                 last_error = exc
                 if self.logger:
                     self.logger.warning("模型请求异常（第 %d 次）：%s", attempt, exc)
+                # 代理连不上时立刻改直连再试一次，不占用原有的重试次数
+                if isinstance(exc, requests.exceptions.ProxyError) and not self._proxy_bypassed:
+                    if self.logger:
+                        self.logger.warning("代理不可用，改为直连重试")
+                    self._bypass_proxy()
+                    max_attempts += 1
+                    continue
                 time.sleep(1.5 * attempt)
                 continue
 
@@ -164,7 +224,8 @@ class DeepSeekClient:
                 )
             return ChatResult(content=content, usage=usage)
 
-        raise LLMError(f"模型调用失败：{last_error}")
+        hint = _PROXY_HINT if isinstance(last_error, requests.exceptions.ProxyError) else ""
+        raise LLMError(f"模型调用失败：{last_error}{hint}")
 
 
 # ------------------------------------------------------------------ 提示词构造

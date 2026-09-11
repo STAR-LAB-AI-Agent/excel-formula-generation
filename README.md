@@ -168,6 +168,11 @@ DeepSeek 为模型服务（需自备密钥），不属于开源依赖。
   `Authorization`、`api_key=` 一律打码），`.env` 已入 `.gitignore`。
 - **异常分类**：文件被 Excel 占用（`PermissionError`）、工作表不存在、模型鉴权失败/余额不足/超时、
   模型返回非 JSON，都有独立的中文提示，不会抛裸栈给用户。
+- **代理容错**：Windows 的系统代理在注册表里只存 `host:port`，Python 会把 https 通道拼成
+  `https://127.0.0.1:端口`，对本机明文代理做 TLS 握手就会报
+  `ProxyError('Unable to connect to proxy')`。客户端启动时把这类回环代理统一降级为 `http://`，
+  真遇到代理连不通还会自动改直连重试一次；也可用 `.env` 里的 `EXCELCR_PROXY` 指定代理、
+  `EXCELCR_TRUST_ENV=0` 强制直连。
 
 ## 9. 上下文规模与准确性的取舍（已实测）
 

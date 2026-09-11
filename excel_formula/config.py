@@ -97,6 +97,9 @@ class Settings:
     timeout: int = DEFAULT_TIMEOUT
     temperature: float = DEFAULT_TEMPERATURE
     max_repair_rounds: int = DEFAULT_MAX_REPAIR_ROUNDS
+    # 显式代理地址（空表示不指定）；trust_env 为 False 时忽略系统/环境代理直连
+    proxy: str = ""
+    trust_env: bool = True
     # 目录白名单：所有读写的 Excel 必须落在这些目录之内
     allowed_roots: list[Path] = field(default_factory=list)
     log_dir: Path = Path("logs")
@@ -118,6 +121,8 @@ class Settings:
             timeout=int(os.environ.get("DEEPSEEK_TIMEOUT", DEFAULT_TIMEOUT)),
             temperature=float(os.environ.get("DEEPSEEK_TEMPERATURE", DEFAULT_TEMPERATURE)),
             max_repair_rounds=int(os.environ.get("EXCELCR_MAX_REPAIR", DEFAULT_MAX_REPAIR_ROUNDS)),
+            proxy=os.environ.get("EXCELCR_PROXY", "").strip(),
+            trust_env=os.environ.get("EXCELCR_TRUST_ENV", "1") != "0",
             allowed_roots=roots,
             log_dir=Path(os.environ.get("EXCELCR_LOG_DIR", "logs")),
             backup=os.environ.get("EXCELCR_BACKUP", "1") != "0",

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import requests
 
 from excel_formula.config import ConfigError, Settings
 from excel_formula.llm_client import (
@@ -12,6 +13,7 @@ from excel_formula.llm_client import (
     build_generate_messages,
     build_repair_message,
     extract_candidates,
+    normalize_proxies,
     parse_json_payload,
 )
 
@@ -31,19 +33,24 @@ class FakeResponse:
 class FakeSession:
     """按顺序返回预置响应，并记录请求头/请求体。"""
 
-    def __init__(self, responses: list[FakeResponse]):
+    def __init__(self, responses: list[FakeResponse], errors: list[Exception] | None = None):
         self.responses = list(responses)
+        self.errors = list(errors or [])
         self.requests: list[dict] = []
+        self.proxies: dict = {"https": "http://127.0.0.1:10808"}
+        self.trust_env = True
 
     def post(self, url, headers=None, data=None, timeout=None):
+        if self.errors:
+            raise self.errors.pop(0)
         self.requests.append({"url": url, "headers": headers or {}, "data": data})
         return self.responses.pop(0)
 
 
-def _client(responses, **kwargs) -> DeepSeekClient:
+def _client(responses, *, errors=None, **kwargs) -> DeepSeekClient:
     settings = Settings(api_key="sk-test", **kwargs)
     client = DeepSeekClient(settings)
-    client._session = FakeSession(responses)
+    client._session = FakeSession(responses, errors)
     return client
 
 
@@ -93,6 +100,54 @@ def test_retries_on_server_error_then_succeeds():
 def test_broken_json_response_raises():
     client = _client([FakeResponse(200, {"unexpected": True})])
     with pytest.raises(LLMError, match="格式异常"):
+        client.chat([])
+
+
+# ------------------------------------------------------------------ 代理处理
+def test_normalize_proxies_downgrades_local_https_proxy():
+    fixed = normalize_proxies(
+        {
+            "http": "http://127.0.0.1:10808",
+            "https": "https://127.0.0.1:10808",  # Windows 系统代理会写成这样
+            "ftp": "ftp://127.0.0.1:10808",
+        }
+    )
+    assert fixed["https"] == "http://127.0.0.1:10808"
+    assert fixed["http"] == "http://127.0.0.1:10808"
+
+
+def test_normalize_proxies_keeps_remote_https_proxy():
+    fixed = normalize_proxies({"https": "https://proxy.example.com:8443"})
+    assert fixed["https"] == "https://proxy.example.com:8443"
+
+
+def test_trust_env_off_means_direct_connection():
+    client = DeepSeekClient(Settings(api_key="sk-test", trust_env=False))
+    assert client._session.proxies == {}
+    assert client._session.trust_env is False
+
+
+def test_explicit_proxy_setting_overrides_system_proxy():
+    client = DeepSeekClient(Settings(api_key="sk-test", proxy="http://127.0.0.1:7890"))
+    assert client._session.proxies["https"] == "http://127.0.0.1:7890"
+    assert client._session.trust_env is False
+
+
+def test_proxy_error_falls_back_to_direct_connection():
+    proxy_error = requests.exceptions.ProxyError("Unable to connect to proxy")
+    client = _client([_ok_response('{"formulas": []}')], errors=[proxy_error])
+
+    result = client.chat([])
+
+    assert result.content == '{"formulas": []}'
+    assert client._session.proxies == {}  # 已放弃代理
+    assert client._session.trust_env is False
+
+
+def test_persistent_proxy_error_message_tells_how_to_fix():
+    errors = [requests.exceptions.ProxyError("Unable to connect to proxy") for _ in range(3)]
+    client = _client([], errors=errors)
+    with pytest.raises(LLMError, match="EXCELCR_TRUST_ENV"):
         client.chat([])
 
 
