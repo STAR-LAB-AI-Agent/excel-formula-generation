@@ -1,0 +1,19 @@
+# 敏感配置：绝不提交真实密钥
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# IDE（含本地绝对路径，不入库）
+.idea/
+.vscode/
+
+# 运行产物
+logs/
+backups/
+~$*.xlsx
