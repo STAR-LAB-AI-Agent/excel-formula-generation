@@ -10,6 +10,7 @@ import re
 import time
 import urllib.request
 from dataclasses import dataclass, field
+from typing import Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -29,15 +30,22 @@ SYSTEM_PROMPT = """你是 Excel 公式专家，负责把中文自然语言需求
    即使 SUM、MIN 这类函数会自动忽略文本，COUNTA、ROWS、INDEX、MATCH、SUMPRODUCT 仍会因为多算一行而出错。
    在 assumptions 里写明认定的数据区，例如「数据区 A3:C10，第 2 行是表头」。
 7. 表中可能同时存在多个数据块（例如主数据区旁边另有说明或参考区），请按列位置分辨，不要混用。
-8. 目标单元格未给出时，选择数据区右侧或下方第一个空位，并在 assumptions 里说明。
-9. 需要用户补充关键信息（例如无法判断统计哪一列）时，把问题写进 clarification 并让 formulas 为空数组。
-10. explanation 用一句中文说明公式含义，不超过 60 字。
+8. 反向查找（要返回的列在查找列左侧）不能用普通 VLOOKUP，但可以用数组常量翻转列顺序：
+   =VLOOKUP(查找值,IF({1,0},查找列,返回列),2,0)。
+   写之前先在 TSV 里核对列的字母位置（首行列字母就是列标），不要想当然地猜列号。
+9. 目标单元格未给出时，选择数据区右侧或下方第一个空位，并在 assumptions 里说明。
+10. 需要用户补充关键信息（例如无法判断统计哪一列）时，把问题写进 clarification 并让 formulas 为空数组。
+11. explanation 用一句中文说明公式含义，不超过 60 字。
+12. 需求包含分类名、标题等已知常量时（例如新建汇总表要写入区域名、班级名、列标题），
+    用 value 字段把这些常量直接写进单元格，不要留给用户手动填；也不要写成 ="华东" 这类“公式化的常量”。
 
 输出 JSON 结构：
 {"formulas": [{"target": "G2", "formula": "=SUM(B2:F2)", "explanation": "求B2到F2的总分",
-"fill_to": "G6"}], "assumptions": ["..."], "clarification": null}
+"fill_to": "G6"}, {"target": "A24", "value": "华东", "explanation": "区域名称"}],
+"assumptions": ["..."], "clarification": null}
 
-fill_to 可选：需要整列向下填充时给出结束单元格，公式会按相对引用自动调整。"""
+每个元素 formula 与 value 二选一：formula 为以 = 开头的公式；value 为直接写入的文本或数字。
+fill_to 可选：需要整列向下填充时给出结束单元格，公式会按相对引用自动调整（value 不支持 fill_to，多个常量逐个列出）。"""
 
 EXPLAIN_PROMPT = """你是 Excel 公式讲解者。用中文解释给定公式：先一句话说明作用，
 再分点说明关键部分（函数、引用区域、判断条件），最后指出常见易错点。总长度不超过 200 字，
@@ -45,7 +53,15 @@ EXPLAIN_PROMPT = """你是 Excel 公式讲解者。用中文解释给定公式�
 
 
 class LLMError(RuntimeError):
-    """调用模型失败（网络、鉴权、返回格式非法）。"""
+    """调用模型失败（网络、鉴权、返回格式非法）。
+
+    ``usage`` 可选：当失败发生在一次已计费的调用上（如输出被截断），
+    携上用量以便上层如实统计，不漏算这次 Token。
+    """
+
+    def __init__(self, *args, usage: "Usage | None" = None):
+        super().__init__(*args)
+        self.usage = usage
 
 
 # 本机代理软件的监听地址，几乎都是明文 HTTP 而非 HTTPS
@@ -118,6 +134,8 @@ class DeepSeekClient:
         self.total_usage = Usage()
         self._session = requests.Session()
         self._proxy_bypassed = False
+        # 流式请求会先带 stream_options 索取 usage；服务端不接受时自动降级
+        self._stream_usage_supported = True
         self._configure_proxies()
 
     def _configure_proxies(self) -> None:
@@ -139,24 +157,55 @@ class DeepSeekClient:
         self._session.trust_env = False
         self._session.proxies = {}
 
-    def chat(self, messages: list[dict], *, json_mode: bool = True, max_tokens: int = 800) -> ChatResult:
+    def chat(
+        self,
+        messages: list[dict],
+        *,
+        json_mode: bool = True,
+        max_tokens: int = 8000,
+        stream: bool | None = None,
+        on_delta: Callable[[str, str], None] | None = None,
+        thinking: str | None = None,
+    ) -> ChatResult:
+        """max_tokens 同时限制思考与正文，思考型模型的实际长度波动很大。
+
+        给足额度：只有真正用完才计费，额度不够反而会在推理中途被截断、白花一次调用。
+
+        stream 为 None 时按调用方意图推断：传了 on_delta（逐段回调，用于流式进度展示）
+        就走 SSE 流式，否则保持一次性返回，既有调用方式零改动。
+
+        thinking 为 None 时用配置值；传入 enabled/disabled 可逐次覆盖（auto 档由
+        流水线按需求复杂度决定，见 FormulaService）。
+        """
         api_key = self.settings.require_api_key()
+        use_stream = (on_delta is not None) if stream is None else stream
         payload: dict = {
             "model": self.settings.model,
             "messages": messages,
             "temperature": self.settings.temperature,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": use_stream,
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        effective_thinking = thinking if thinking is not None else self.settings.thinking
+        if effective_thinking == "auto":
+            effective_thinking = ""  # 调用方未给出具体档位时按服务端默认
+        if effective_thinking:
+            payload["thinking"] = {"type": effective_thinking}
+        if self.settings.reasoning_effort:
+            payload["reasoning_effort"] = self.settings.reasoning_effort
+        if use_stream and self._stream_usage_supported:
+            # 不显式索取时，流式的最后一个分片不会带 usage，Token 统计会少算
+            payload["stream_options"] = {"include_usage": True}
 
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         if self.logger:
             self.logger.info(
-                "调用模型 model=%s json_mode=%s 消息数=%d 输入字符数=%d",
+                "调用模型 model=%s json_mode=%s 流式=%s 消息数=%d 输入字符数=%d",
                 self.settings.model,
                 json_mode,
+                use_stream,
                 len(messages),
                 sum(len(m.get("content", "")) for m in messages),
             )
@@ -172,6 +221,7 @@ class DeepSeekClient:
                     headers=headers,
                     data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                     timeout=self.settings.timeout,
+                    stream=use_stream,
                 )
             except requests.RequestException as exc:
                 last_error = exc
@@ -187,27 +237,49 @@ class DeepSeekClient:
                 time.sleep(1.5 * attempt)
                 continue
 
-            elapsed = time.perf_counter() - started
-            if response.status_code == 401:
-                raise LLMError("DeepSeek 鉴权失败（401），请检查 DEEPSEEK_API_KEY 是否有效")
-            if response.status_code == 402:
-                raise LLMError("DeepSeek 账户余额不足（402）")
-            if response.status_code in {429, 500, 502, 503, 504}:
-                last_error = LLMError(f"服务暂时不可用（HTTP {response.status_code}）")
+            action, status_error = self._classify_status(response)
+            if action != "ok":
+                response.close()
+            if action == "drop_stream_options" and "stream_options" in payload:
+                # 服务端不认 stream_options：去掉它再试，宁愿少算用量也不阻塞用户
+                payload.pop("stream_options", None)
+                self._stream_usage_supported = False
+                if self.logger:
+                    self.logger.warning("服务端不接受 stream_options，改为不带用量参数重试")
+                max_attempts += 1
+                continue
+            if action == "retry":
+                last_error = status_error
                 if self.logger:
                     self.logger.warning("模型返回 %s，准备重试", response.status_code)
                 time.sleep(1.5 * attempt)
                 continue
-            if response.status_code != 200:
-                raise LLMError(f"模型返回 HTTP {response.status_code}: {response.text[:200]}")
+            if action != "ok":
+                raise status_error  # 鉴权失败、余额不足等直接抛给上层
 
-            try:
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-            except (ValueError, KeyError, IndexError) as exc:
-                raise LLMError(f"模型返回格式异常：{exc}") from exc
+            if use_stream:
+                try:
+                    content, raw_usage, finish_reason, ttft = self._read_stream(response, on_delta)
+                except requests.RequestException as exc:
+                    last_error = exc
+                    if self.logger:
+                        self.logger.warning("流式响应读取中断（第 %d 次）：%s", attempt, exc)
+                    time.sleep(1.5 * attempt)
+                    continue
+                finally:
+                    response.close()
+            else:
+                try:
+                    data = response.json()
+                    choice = data["choices"][0]
+                    content = choice["message"]["content"]
+                    finish_reason = choice.get("finish_reason")
+                except (ValueError, KeyError, IndexError) as exc:
+                    raise LLMError(f"模型返回格式异常：{exc}") from exc
+                raw_usage = data.get("usage") or {}
+                ttft = None
 
-            raw_usage = data.get("usage") or {}
+            elapsed = time.perf_counter() - started
             usage = Usage(
                 prompt_tokens=int(raw_usage.get("prompt_tokens", 0)),
                 completion_tokens=int(raw_usage.get("completion_tokens", 0)),
@@ -222,10 +294,88 @@ class DeepSeekClient:
                     usage.completion_tokens,
                     elapsed,
                 )
+                if ttft is not None:
+                    self.logger.info("流式首包 %.2fs", ttft)
+                elif use_stream and not raw_usage:
+                    self.logger.warning("流式响应未携带 usage，本次 Token 用量按 0 计")
+
+            # 思考型模型的推理过程也计入 completion_tokens，额度用尽时 content 会是空串，
+            # 直接交给 parse_json_payload 只会报"未返回 JSON"，掩盖真实原因
+            if finish_reason == "length":
+                raise LLMError(
+                    f"模型输出被 max_tokens({max_tokens}) 截断，已消耗 "
+                    f"{usage.completion_tokens} 输出 tokens 但没拿到完整结果。"
+                    "请把需求说得更具体，或缩小表格范围后重试",
+                    usage=usage,
+                )
+            if not (content or "").strip():
+                raise LLMError(
+                    f"模型返回了空内容（finish_reason={finish_reason}）", usage=usage
+                )
             return ChatResult(content=content, usage=usage)
 
         hint = _PROXY_HINT if isinstance(last_error, requests.exceptions.ProxyError) else ""
         raise LLMError(f"模型调用失败：{last_error}{hint}")
+
+    # -------------------------------------------------------------- 流式与状态处理
+    @staticmethod
+    def _classify_status(response) -> tuple[str, LLMError | None]:
+        """把响应状态码归类：ok / retry / drop_stream_options / 直接抛出。"""
+        code = response.status_code
+        if code == 200:
+            return "ok", None
+        if code == 401:
+            return "raise", LLMError("DeepSeek 鉴权失败（401），请检查 DEEPSEEK_API_KEY 是否有效")
+        if code == 402:
+            return "raise", LLMError("DeepSeek 账户余额不足（402）")
+        if code in {429, 500, 502, 503, 504}:
+            return "retry", LLMError(f"服务暂时不可用（HTTP {code}）")
+        body = response.text[:200]
+        if code == 400 and "stream_options" in body:
+            return "drop_stream_options", LLMError(f"模型返回 HTTP 400: {body}")
+        return "raise", LLMError(f"模型返回 HTTP {code}: {body}")
+
+    def _read_stream(self, response, on_delta) -> tuple[str, dict, str | None, float | None]:
+        """读取 SSE 流：拼回正文、收集 usage 与 finish_reason，并返回首包耗时。
+
+        on_delta(piece, kind) 会分别收到思考片段（reasoning）与正文片段（content），
+        由调用方决定怎么展示；中途断网由 requests 抛 RequestException，交给上层重试。
+        """
+        parts: list[str] = []
+        raw_usage: dict = {}
+        finish_reason: str | None = None
+        started = time.perf_counter()
+        ttft: float | None = None
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            chunk_text = line[5:].strip() if line.startswith("data:") else line.strip()
+            if not chunk_text or chunk_text == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(chunk_text)
+            except json.JSONDecodeError:
+                continue  # 心跳或注释行
+            if chunk.get("usage"):
+                raw_usage = chunk["usage"]
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            thinking = delta.get("reasoning_content") or ""
+            piece = delta.get("content") or ""
+            if (thinking or piece) and ttft is None:
+                ttft = time.perf_counter() - started
+            if thinking and on_delta is not None:
+                on_delta(thinking, "reasoning")
+            if piece:
+                parts.append(piece)
+                if on_delta is not None:
+                    on_delta(piece, "content")
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+        return "".join(parts), raw_usage, finish_reason, ttft
 
 
 # ------------------------------------------------------------------ 提示词构造
@@ -296,12 +446,18 @@ def parse_json_payload(content: str) -> dict:
 
 
 def extract_candidates(data: dict) -> tuple[list[dict], list[str], str | None]:
-    """标准化模型输出，返回 (公式列表, 假设列表, 追问问题)。"""
+    """标准化模型输出，返回 (公式列表, 假设列表, 追问问题)。
+
+    列表元素 formula 与 value 二选一：formula 为公式（以 = 开头），
+    value 为直接写入的常量（分类名、标题等）。
+    """
     raw = data.get("formulas")
-    if raw is None and data.get("formula"):  # 兼容模型只给单个公式的情况
+    if raw is None and (data.get("formula") or data.get("value") is not None):
+        # 兼容模型只给单个目标的情况
         raw = [{
             "target": data.get("target"),
             "formula": data.get("formula"),
+            "value": data.get("value"),
             "explanation": data.get("explanation", ""),
             "fill_to": data.get("fill_to"),
         }]
@@ -309,13 +465,15 @@ def extract_candidates(data: dict) -> tuple[list[dict], list[str], str | None]:
     for entry in raw or []:
         if not isinstance(entry, dict):
             continue
-        formula = str(entry.get("formula", "")).strip()
-        if not formula:
+        formula = str(entry.get("formula") or "").strip()
+        value = entry.get("value")
+        if not formula and value is None:
             continue
         items.append(
             {
                 "target": str(entry.get("target") or "").strip(),
                 "formula": formula,
+                "value": value,
                 "explanation": str(entry.get("explanation") or "").strip(),
                 "fill_to": str(entry.get("fill_to") or "").strip() or None,
             }

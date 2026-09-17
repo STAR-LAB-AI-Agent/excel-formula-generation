@@ -16,22 +16,32 @@ from .formula_parser import parse_target
 
 @dataclass
 class CellWrite:
-    """一次待写入操作。old_formula/old_value/predicted 均仅用于预览与回溯。"""
+    """一次待写入操作。formula 为空表示写常量值（value）：分类名、标题等非公式内容。
+
+    old_formula/old_value/predicted 均仅用于预览与回溯。
+    """
 
     sheet: str
     cell: str
     formula: str
+    value: object = None
     explanation: str = ""
     old_formula: str | None = None
     old_value: object = None
     predicted: str | None = None
     predicted_note: str | None = None
 
+    @property
+    def content(self) -> object:
+        """写入单元格的实际内容：公式或常量值（二选一）。"""
+        return self.formula if self.formula else self.value
+
     def to_dict(self) -> dict:
         return {
             "sheet": self.sheet,
             "cell": self.cell,
             "formula": self.formula,
+            "value": self.value,
             "explanation": self.explanation,
             "overwrites": self.old_formula or (
                 None if self.old_value is None else str(self.old_value)
@@ -105,7 +115,10 @@ def apply_writes(
         for item in writes:
             if item.sheet not in workbook.sheetnames:
                 raise KeyError(f"工作表 {item.sheet!r} 不存在")
-            workbook[item.sheet][item.cell] = item.formula
+            content = item.content
+            if content is None or (isinstance(content, str) and not content.strip()):
+                raise ValueError(f"{item.sheet}!{item.cell} 没有可写入的内容")
+            workbook[item.sheet][item.cell] = content
         try:
             workbook.save(target_path)
         except PermissionError as exc:

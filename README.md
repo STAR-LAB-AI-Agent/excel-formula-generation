@@ -14,13 +14,13 @@ openpyxl 逐格读出工作表（只搬运，不推断表头与列类型）
         ↓
 无损 TSV 文本化（带行号/列字母坐标系，超 200 行才头尾截断）
         ↓
-DeepSeek API：自行判断表头行与数据区 → 输出公式 JSON
+DeepSeek API：自行判断表头行与数据区 → 输出公式/常量值 JSON
         ↓
 本地校验：语法 AST + 函数白名单 + 引用范围 + 循环引用 + 参数个数
         ↓
 校验失败？→ 只回传公式与错误信息给 DeepSeek，最多重试 2 次
         ↓
-预览（公式 / 影响单元格 / 预期结果 / 是否覆盖旧内容）+ 用户确认
+预览（公式或常量值 / 影响单元格 / 预期结果 / 是否覆盖旧内容）+ 用户确认
         ↓
 openpyxl 写入并保存（自动备份原文件）
         ↓
@@ -60,8 +60,8 @@ python main.py
 python main.py "帮我在G2算每个科目的总分，填充到G6"
 ```
 
-交互模式内置指令：`:file <路径>` 切换文件、`:sheet <表名>` 指定工作表、`:info` 查看表结构（零 Token）、
-`:help`、`:quit`。
+交互模式内置指令：`:file <路径>` 切换文件、`:sheet <表名>` 指定工作表、`:think <1|0|auto>` 思考开关（立即生效）、
+`:info` 查看表结构（零 Token）、`:help`、`:quit`。
 
 ### 一次真实交互长什么样
 
@@ -82,6 +82,38 @@ python main.py "帮我在G2算每个科目的总分，填充到G6"
   原文件已备份：测试数据_20260910_142530.xlsx
   日志：logs/excelcr.log
 ```
+
+### 响应速度与流式输出
+
+- **流式输出**：生成公式与解释公式时走 SSE 流式接口，终端上以一行原地刷新的进度显示
+  `… 模型思考 1234 字 / 正文 56 字，已用 12s`——模型是在思考还是卡住了，一目了然；
+  流式请求会自动携带 `stream_options.include_usage`，Token 用量照常从最后一个分片回收。
+  非交互终端（重定向/管道）自动退回一次性返回，程序化调用零变化。
+- **思考开关（1/0）**：DeepSeek V4.x 默认开启思考且强度为 `high`，思考内容同样计入 `max_tokens`
+  与计费（这是“明明只是生成一条公式却等了 40 秒”的主因）。`.env` 里用一个数字开关控制：
+
+  ```
+  EXCELCR_THINKING=0             # 最快：始终关闭思考，直接出公式
+  EXCELCR_THINKING=1             # 深度思考常开：每次都思考，最准也最慢
+  EXCELCR_THINKING=auto          # 自动：按需求复杂度切换（规则见下）
+  EXCELCR_REASONING_EFFORT=low   # 可叠加：保留思考时降低推理强度
+  ```
+
+  `on/off` 与 `enabled/disabled` 是等价别名。交互模式里可随时切换、立即生效，不用改配置重启：
+
+  ```
+  :think 1      # 打开深度思考
+  :think 0      # 关闭，追求最快
+  :think auto   # 恢复按复杂度自动
+  :think        # 查看当前档位
+  ```
+
+  流式进度行在两种档位下都会显示，区别只在看到的是「模型思考 N 字」增长（开思考时）
+  还是「正文 N 字」直接跳动（关闭时）。
+
+  `auto` 档的判定规则：需求超过 24 字、表格超过 40 行/12 列、或命中跨表/多条件/查找匹配等
+  关键词时保留思考；**首轮校验失败后的修复轮次一律升级为思考兜底**；其余情况关闭思考
+  （`explain` 按公式长度 60 字符分界）。留空则完全保持服务端默认行为。
 
 ## 4. 底层 Script/CLI（可独立运行、可被 Skill 调用）
 
@@ -130,7 +162,7 @@ Skill 中强制约定：**先预览、展示给用户、拿到同意后才允许
 | `excel_formula/cli.py` | 命令行接口，6 个子命令，可独立测试 |
 | `excel_formula/intent.py` | 规则意图识别与参数抽取（文件/工作表/目标单元格/填充范围/公式） |
 | `excel_formula/excel_reader.py` | openpyxl 读取、**无损 TSV 文本化**（不推断表头与类型，只做行数闸门） |
-| `excel_formula/llm_client.py` | DeepSeek 调用、提示词、JSON 解析、Token 统计 |
+| `excel_formula/llm_client.py` | DeepSeek 调用（含 SSE 流式与 Token 统计）、提示词、JSON 解析 |
 | `excel_formula/formula_parser.py` | 公式分词器 + 递归下降语法分析器（产出 AST） |
 | `excel_formula/validator.py` | 静态校验：语法、函数白名单、参数个数、引用范围、循环引用 |
 | `excel_formula/evaluator.py` | 公式独立求值器（Python 重算一遍，用于"公式自动验证"） |
@@ -140,7 +172,7 @@ Skill 中强制约定：**先预览、展示给用户、拿到同意后才允许
 | `excel_formula/logger.py` | 日志与密钥脱敏 |
 | `scripts/measure_digest.py` | 提示词规模检查脚本（文本化后有多大、是否触发截断） |
 | `skills/excel-formula/SKILL.md` | 供智能体调用的 Skill 说明 |
-| `tests/` | 75 个自动化测试用例（不需要联网）+ 手工验收用例清单 |
+| `tests/` | 319 个自动化测试用例（不需要联网，含大作业实景复刻与真实文件对账）+ 手工验收用例清单 |
 
 ## 7. 开源项目集成
 
@@ -200,26 +232,54 @@ large.xlsx      500行 × 8列             2867        60       440
 
 ## 10. 可选功能：公式自动验证
 
-`excel_formula/evaluator.py` 用 Python 独立实现了常用函数子集（SUM/AVERAGE/MAX/MIN/COUNT/COUNTIF/
-SUMIF/SUMIFS/IF/IFERROR/ROUND/RANK/VLOOKUP/文本函数/四则运算与比较等），在**写入之前**把公式算一遍：
+`excel_formula/evaluator.py` 用 Python 独立实现了常用函数子集，在**写入之前**把公式算一遍：
+
+- 数学：`SUM/PRODUCT/ABS/ROUND/ROUNDUP/ROUNDDOWN/INT/TRUNC/MOD/POWER/SQRT/SIGN/EXP/LN/LOG/LOG10/CEILING/FLOOR/SUMPRODUCT`
+- 统计：`AVERAGE/AVERAGEIF/AVERAGEIFS/MEDIAN/MODE(.SNGL)/COUNT/COUNTA/COUNTBLANK/COUNTIF/COUNTIFS/MAX/MAXIFS/MIN/MINIFS/LARGE/SMALL/RANK(.EQ)/STDEV(.S/.P)/STDEVP/VAR(.S/.P)`
+- 查找：`VLOOKUP/HLOOKUP/XLOOKUP/LOOKUP/INDEX/MATCH`
+- 逻辑：`IF/IFS/IFERROR/IFNA/AND/OR/NOT/XOR/CHOOSE/SWITCH/TRUE/FALSE`
+- 文本：`LEN/LEFT/RIGHT/MID/FIND/SEARCH/SUBSTITUTE/REPLACE/REPT/TRIM/CONCAT/CONCATENATE/TEXTJOIN/UPPER/LOWER/PROPER/CHAR/CODE/VALUE`
+- 信息：`ISBLANK/ISNUMBER/ISTEXT/ISERROR/ISERR/ISNA/ISEVEN/ISODD/NA/ROWS/COLUMNS`
+
+行为约定：
 
 - 算得出结果 → 预览显示 `预期结果: 438`，用户可当场判断对不对；
 - 算出 `#DIV/0!` 等错误值 → 提前暴露问题；
-- 遇到不支持的函数或未计算的公式引用 → 显示 `未验证（原因）`，不阻断流程。
+- 遇到不支持的函数或未计算的公式引用 → 显示 `未验证（原因）`，不阻断流程；
+- 区域里含日期时只做占位包装（例如 `VLOOKUP` 的查找区域含日期列不会拖垮整式），
+  日期一旦真的参与算术/比较，或区域直接参与标量运算（数组公式语义），
+  一律标"未验证"而不是给出静默算错的结果；
+- 所有"未验证"路径都抛 `UnsupportedFormula`（异常消息带原因），
+  对应上面第 8 节点的"宁可未验证也不静默算错"。
 
 这是独立于 DeepSeek 的第二条计算路径，属于"生成结果的交叉校验"，而不是让模型自证。
 
 ## 11. 测试
 
 ```powershell
-python -m pytest tests -q          # 72 个用例，全部离线（用 FakeClient / FakeSession 替代网络）
+python -m pytest tests -q          # 319 个用例，全部离线（用 FakeClient / FakeSession 替代网络）
 python -m pytest tests -v          # 查看每个用例
+python -m pytest tests/test_homework_smoke.py -v   # 真实大作业文件对账（文件不在时自动跳过）
 ```
 
 覆盖范围：正常公式、缺 `=`、括号不配对、未知函数、禁用函数、参数个数错误、循环引用、越界引用警告、
 不存在的工作表、中文列名、易变函数、绝对引用与百分号、整表无损文本化与头尾截断、12 个公式求值对照、
 除零、不支持函数、生成并写入、预览不落盘、重试修复、连续失败放弃、追问、覆盖提示、
-目录越界、非法后缀、写入规模上限、日志脱敏、DeepSeek 鉴权失败/服务端错误重试/返回值解析。
+目录越界、非法后缀、写入规模上限、日志脱敏、DeepSeek 鉴权失败/服务端错误重试/返回值解析、
+SSE 流式分片重组与 usage 回收（含 `stream_options` 被拒后的自动降级与思考开关下发）、
+auto 思考档的复杂度启发式（简单直算关闭、修复轮次升级）。
+
+2026-09 扩展（以大作业 `Excel大作业.xlsm` 为素材）：
+
+- `tests/test_formula_library.py`（163 个）：逐族覆盖全部已实现函数的返回值与错误值，
+  并钉住与 Excel 的语义一致性（`MOD` 负数取模符号跟随除数、`ISERR` 对 `#N/A` 返回 FALSE、
+  `TRUNC` 支持位数、`CEILING/FLOOR` 负数方向等）；
+- `tests/test_homework_formulas.py`（29 个）：把课程作业里的公式清单原样搬进测试——
+  三层嵌套 IF 评级四档全覆盖、统计区六件套、跨表 SUMIFS、`IFERROR+VLOOKUP`、
+  日期列防护与区域数组语义防护；
+- `tests/test_homework_smoke.py`：直接打开真实 `Excel大作业.xlsm`，把 85 个公式逐个
+  本地重算并与 Excel 缓存值对账（83 个一致、2 个定义名称公式标"未验证"）；
+- `tests/test_pipeline.py`：新增跨表公式端到端用例（预览即给出本地独立试算值）。
 
 `tests/test_logger.py` 单独钉住了一个真实踩过的坑：脱敏过滤器曾把所有日志参数一律 `str()` 化，
 导致 `%d` / `%.2f` 占位符在格式化时抛 `TypeError`——logging 会把错误打到 stderr 并**丢弃这条记录**，
@@ -232,7 +292,8 @@ Token 用量因此从未写进日志文件。现在数字参数原样放过，�
 - openpyxl 保存会丢失原文件中的图表、图片、数据透视表等对象；含这些内容的文件建议先 `--output` 另存验证。
 - 公式写入后 openpyxl 不会计算结果，单元格缓存值为空，需在 Excel/WPS 中打开一次才显示数值；
   这也是"本地预期结果"存在的原因。
-- 本地求值器只覆盖常用函数子集，日期运算、数组公式、通配符条件（`"张*"`）会返回"未验证"。
+- 本地求值器只覆盖常用函数子集，日期运算、数组公式（区域直接参与四则运算/比较）、
+  通配符条件（`"张*"`）会返回"未验证"；含日期列的区域本身可以正常被 VLOOKUP/SUMIFS 按行取值。
 - 跨工作簿引用（`[book2]Sheet1!A1`）未支持，会被校验拦下。
 - 意图识别是规则实现，极端口语化的表述可能落到"生成"分支；此时程序会追问而不是乱写。
 - `describe` 对超宽表只列出前 40 列，其余以"另有 N 列未列出"提示。
@@ -240,4 +301,6 @@ Token 用量因此从未写进日志文件。现在数字参数原样放过，�
 ## 13. 数据与合规
 
 `测试数据.xlsx` 为课程虚构数据（5 个科目 × 5 名学生的分数），不含真实个人信息。
+`Excel大作业.xlsm` 为个人课程作业文件（虚构销售订单），仅用于本地实景测试，
+`tests/test_homework_smoke.py` 在文件不存在时自动跳过，仓库中不含该文件。
 仓库内不存放任何真实密钥，只提供 `.env.example`。

@@ -17,6 +17,7 @@ from .intent import (
     INTENT_EXPLAIN,
     INTENT_VALIDATE,
     classify,
+    file_candidates,
 )
 from .llm_client import LLMError
 from .logger import get_logger
@@ -123,6 +124,19 @@ def _proposal_output(proposal: Proposal, applied: dict | None) -> tuple[dict, st
 
 
 # ------------------------------------------------------------------ 各子命令
+def _pick_existing(service: FormulaService, name: str | None) -> str | None:
+    """自然语言里抓到的文件名可能粘上了中文介词，挑第一个真存在的候选。"""
+    if not name:
+        return None
+    for candidate in file_candidates(name):
+        try:
+            service.settings.resolve_path(candidate)
+        except (SecurityError, FileNotFoundError):
+            continue
+        return candidate
+    return name  # 一个都不存在：仍用原文件名报错，错误信息更贴近用户输入
+
+
 def _cmd_describe(service: FormulaService, args) -> int:
     result = service.describe(args.file, args.sheet)
     lines = [f"文件: {result['file']}"]
@@ -200,7 +214,7 @@ def _cmd_write(service: FormulaService, args) -> int:
 
 def _cmd_nl(service: FormulaService, args) -> int:
     intent = classify(args.text)
-    file = intent.file or args.file
+    file = _pick_existing(service, intent.file) or args.file
     sheet = intent.sheet or args.sheet
     if not file:
         payload = {"ok": False, "intent": intent.to_dict(), "question": "请告诉我要操作哪个 Excel 文件？"}

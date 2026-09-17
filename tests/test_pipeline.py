@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 from openpyxl import load_workbook
 
 from excel_formula.config import SecurityError
-from excel_formula.llm_client import ChatResult, DeepSeekClient, Usage
+from excel_formula.excel_reader import WorkbookView
+from excel_formula.llm_client import ChatResult, DeepSeekClient, LLMError, Usage
 from excel_formula.pipeline import FormulaService
 
 
@@ -80,6 +82,56 @@ def test_rejects_batch_when_one_formula_is_invalid(sample_xlsx, settings):
     assert "INDIRECT" in proposal.error
 
 
+# ------------------------------------------------------------------ 常量值写入
+def test_value_writes_alongside_formulas(sample_xlsx, settings):
+    """新建汇总表场景：分类名用 value 直接写入，公式引用这些名称。"""
+    service = _service(
+        settings,
+        [{
+            "formulas": [
+                {"target": "A8", "value": "甲班", "explanation": "分组名称"},
+                {"target": "B8", "value": 3.5},
+                {"target": "G2", "formula": "=SUM(B2:F2)", "explanation": "总分", "fill_to": "G6"},
+            ],
+            "assumptions": [],
+            "clarification": None,
+        }],
+    )
+    proposal = service.propose(sample_xlsx, "建一张分组表")
+
+    assert proposal.ok
+    assert [(w.cell, w.value) for w in proposal.writes if not w.formula] == [
+        ("A8", "甲班"), ("B8", 3.5)
+    ]
+    rendered = proposal.render()
+    assert "A8 = 甲班" in rendered
+    assert "B8 = 3.5" in rendered
+    assert "填充: G3 → G6（共 4 个单元格）" in rendered
+
+    applied = service.apply(proposal)
+    assert applied["count"] == 7
+    workbook = load_workbook(sample_xlsx)
+    assert workbook["Sheet1"]["A8"].value == "甲班"
+    assert workbook["Sheet1"]["B8"].value == 3.5
+    assert workbook["Sheet1"]["G2"].value == "=SUM(B2:F2)"
+    workbook.close()
+
+
+def test_value_starting_with_equals_is_rejected(sample_xlsx, settings):
+    """常量值不能夹带公式：以 = 开头的 value 直接拒绝，不给写入通道。"""
+    bad = {
+        "formulas": [{"target": "A8", "value": "=SUM(A1:A5)", "explanation": "伪装成值"}],
+        "assumptions": [],
+        "clarification": None,
+    }
+    service = _service(settings, [bad, bad, bad])
+    proposal = service.propose(sample_xlsx, "在A8写点东西")
+
+    assert not proposal.ok
+    assert not proposal.writes
+    assert "formula 字段" in proposal.error
+
+
 # ------------------------------------------------------------------ 正常链路
 def test_generate_and_apply(sample_xlsx, settings):
     service = _service(
@@ -117,6 +169,50 @@ def test_preview_does_not_touch_file(sample_xlsx, settings):
     assert sample_xlsx.read_bytes() == before  # 预览阶段绝不写盘
 
 
+# ------------------------------------------------------------------ 大作业场景（跨表）
+def test_cross_sheet_sumifs_end_to_end(sales_xlsx, settings):
+    """复刻大作业跨表统计：查询表按负责人汇总销售额，预览即给出本地独立试算值。"""
+    cross_sheet = {
+        "formulas": [
+            {"target": "E2",
+             "formula": "=SUMIFS(原始数据表!$J$2:$J$9, 原始数据表!$G$2:$G$9, D2)",
+             "explanation": "按 D2 的负责人汇总销售额"},
+        ],
+        "assumptions": [],
+        "clarification": None,
+    }
+    service = _service(settings, [cross_sheet])
+    proposal = service.propose(sales_xlsx, "在查询表E2按负责人汇总销售额", sheet="查询表")
+
+    assert proposal.ok
+    assert proposal.predicted == "51500"  # 张伟 27500 + 24000，一次通过不需重试
+    assert len(service.client.calls) == 1
+
+    applied = service.apply(proposal)
+    assert applied["count"] == 1
+    workbook = load_workbook(sales_xlsx)
+    assert workbook["查询表"]["E2"].value.startswith("=SUMIFS(")
+    workbook.close()
+
+
+def test_cross_sheet_vlookup_end_to_end(sales_xlsx, settings):
+    """查找区域含日期列时不再拖垮整式：预览给出客户名称而不是"未验证"。"""
+    lookup = {
+        "formulas": [
+            {"target": "B5",
+             "formula": '=IFERROR(VLOOKUP($B$3, 原始数据表!$A$2:$L$9, 3, FALSE), "未找到订单")',
+             "explanation": "按订单编号查客户名称"},
+        ],
+        "assumptions": [],
+        "clarification": None,
+    }
+    service = _service(settings, [lookup])
+    proposal = service.propose(sales_xlsx, "在查询表B5按订单编号查客户名称", sheet="查询表")
+
+    assert proposal.ok
+    assert proposal.predicted == "赵丽"
+
+
 # ------------------------------------------------------------------ 校验重试
 def test_repair_loop_fixes_invalid_formula(sample_xlsx, settings):
     service = _service(
@@ -148,6 +244,57 @@ def test_gives_up_after_max_rounds(sample_xlsx, settings):
     assert "高风险函数" in proposal.error
     with pytest.raises(ValueError):
         service.apply(proposal)  # 未通过校验的方案禁止写入
+
+
+def test_reverse_vlookup_with_array_constant_works(sample_xlsx, settings):
+    """反向 VLOOKUP（IF({1,0},…)）现在能通过校验，并被本地独立算出预期值。"""
+    reverse = {
+        "formulas": [
+            {"target": "B5",
+             "formula": "=VLOOKUP(B2,IF({1,0},E2:E9,D2:D9),2,0)",
+             "explanation": "用数组常量翻转列顺序做反向查找"}
+        ]
+    }
+    service = _service(settings, [reverse])
+    proposal = service.propose(sample_xlsx, "在B5用VLOOKUP根据B2的姓名查员工号")
+
+    assert proposal.ok
+    assert len(service.client.calls) == 1  # 一次通过，不需要重试
+    # sample_xlsx 的 B2 是 85，E 列没有匹配值，精确查找应得到 #N/A 而不是报错
+    assert proposal.predicted == "#N/A"
+
+
+def test_truncated_call_usage_is_counted(sample_xlsx, settings):
+    """第二轮输出被截断时，那次调用的用量不能从总账中丢失。"""
+
+    class TruncatingClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, *, json_mode=True, max_tokens=800):
+            self.calls += 1
+            if self.calls == 1:
+                # 第一轮给个含自身的错误公式，触发一次修复
+                return ChatResult(
+                    content=json.dumps({"formulas": [
+                        {"target": "G2", "formula": "=SUM(B2:G2)", "explanation": "含自身"}]}),
+                    usage=Usage(prompt_tokens=700, completion_tokens=1500, calls=1),
+                )
+            # 第二轮模拟被 max_tokens 截断：报错但携上用量
+            raise LLMError(
+                "模型输出被 max_tokens 截断",
+                usage=Usage(prompt_tokens=1000, completion_tokens=2000, calls=1),
+            )
+
+    service = FormulaService(settings, logger=None, client=TruncatingClient())
+    proposal = service.propose(sample_xlsx, "算总分写到G2")
+
+    assert not proposal.ok
+    assert "截断" in proposal.error
+    # 两次调用的用量都要计入：1500 + 2000
+    assert proposal.usage.calls == 2
+    assert proposal.usage.completion_tokens == 3500
+    assert proposal.usage.prompt_tokens == 1700
 
 
 def test_clarification_is_returned(sample_xlsx, settings):
@@ -237,7 +384,7 @@ def test_pipeline_with_real_client_and_fake_socket(sample_xlsx, settings):
             }
 
     class FakeSession:
-        def post(self, url, headers=None, data=None, timeout=None):
+        def post(self, url, headers=None, data=None, timeout=None, stream=False):
             assert headers["Authorization"].startswith("Bearer ")
             return FakeResponse()
 
@@ -250,3 +397,103 @@ def test_pipeline_with_real_client_and_fake_socket(sample_xlsx, settings):
     assert proposal.formula == "=AVERAGE(B2:F2)"
     assert proposal.predicted == "87.6"
     assert proposal.usage.prompt_tokens == 380
+
+
+# ------------------------------------------------------------------ 流式接缝
+def test_propose_passes_on_delta_to_client(sample_xlsx, settings):
+    """交互入口传了流式回调时，pipeline 必须把它透传给客户端（走 SSE）。"""
+
+    class RecordingClient:
+        def __init__(self):
+            self.seen_on_delta = None
+
+        def chat(self, messages, *, json_mode=True, max_tokens=800, on_delta=None):
+            self.seen_on_delta = on_delta
+            if on_delta is not None:
+                on_delta("先看看表结构", "reasoning")
+                on_delta('{"formulas"', "content")
+            return ChatResult(
+                content=json.dumps(
+                    {"formulas": [
+                        {"target": "G2", "formula": "=SUM(B2:F2)", "explanation": "总分"}]},
+                    ensure_ascii=False,
+                ),
+                usage=Usage(prompt_tokens=10, completion_tokens=5, calls=1),
+            )
+
+    client = RecordingClient()
+    service = FormulaService(settings, logger=None, client=client)
+    seen: list[tuple[str, str]] = []
+    proposal = service.propose(
+        sample_xlsx, "算总分", on_delta=lambda piece, kind: seen.append((kind, piece))
+    )
+
+    assert proposal.ok
+    assert callable(client.seen_on_delta)
+    assert seen == [("reasoning", "先看看表结构"), ("content", '{"formulas"')]
+
+
+# ------------------------------------------------------------------ auto 思考档
+def test_auto_thinking_disables_for_simple_request(sample_xlsx, settings):
+    """auto 档：短需求 + 小表直接跳过思考，把等待时间降下来。"""
+
+    class ThinkingRecorder:
+        def __init__(self):
+            self.thinking_values: list[str | None] = []
+
+        def chat(self, messages, *, json_mode=True, max_tokens=800, on_delta=None, thinking=None):
+            self.thinking_values.append(thinking)
+            return ChatResult(
+                content=json.dumps(
+                    {"formulas": [
+                        {"target": "G2", "formula": "=SUM(B2:F2)", "explanation": "总分"}]},
+                    ensure_ascii=False,
+                ),
+                usage=Usage(prompt_tokens=10, completion_tokens=5, calls=1),
+            )
+
+    client = ThinkingRecorder()
+    service = FormulaService(replace(settings, thinking="auto"), logger=None, client=client)
+    proposal = service.propose(sample_xlsx, "算总分")
+
+    assert proposal.ok
+    assert client.thinking_values == ["disabled"]
+
+
+def test_auto_thinking_upgrades_on_repair_round(sample_xlsx, settings):
+    """auto 档：首轮没过校验后，修复轮次自动升级为思考模式兜底。"""
+
+    class RepairRecorder:
+        def __init__(self):
+            self.thinking_values: list[str | None] = []
+
+        def chat(self, messages, *, json_mode=True, max_tokens=800, on_delta=None, thinking=None):
+            self.thinking_values.append(thinking)
+            formula = "=SUM(B2:G2)" if len(self.thinking_values) == 1 else "=SUM(B2:F2)"
+            return ChatResult(
+                content=json.dumps(
+                    {"formulas": [
+                        {"target": "G2", "formula": formula, "explanation": "总分"}]},
+                    ensure_ascii=False,
+                ),
+                usage=Usage(prompt_tokens=10, completion_tokens=5, calls=1),
+            )
+
+    client = RepairRecorder()
+    service = FormulaService(replace(settings, thinking="auto"), logger=None, client=client)
+    proposal = service.propose(sample_xlsx, "算总分")
+
+    assert proposal.ok
+    assert client.thinking_values == ["disabled", "enabled"]
+
+
+def test_auto_thinking_heuristics(sample_xlsx, settings):
+    """启发式各分支：简单直算关闭；信号词/长需求/大表/修复轮次保留思考。"""
+    service = FormulaService(replace(settings, thinking="auto"), logger=None, client=FakeClient([]))
+    with WorkbookView(sample_xlsx) as view:
+        digest = view.digest("Sheet1")
+
+        assert service._auto_thinking("算总分", digest, 0) == "disabled"
+        assert service._auto_thinking("跨表汇总销售额", digest, 0) == "enabled"
+        assert service._auto_thinking("很长的需求描述" * 5, digest, 0) == "enabled"
+        assert service._auto_thinking("算总分", digest, 1) == "enabled"  # 修复轮次

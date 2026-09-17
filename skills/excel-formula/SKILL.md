@@ -59,7 +59,7 @@ openpyxl 逐格读表 → 无损 TSV 文本化 → DeepSeek 判断表头并生�
   "target": "G2",
   "formula": "=SUM(B2:F2)",
   "explanation": "对B2到F2求和得到总分",
-  "cells": [{"sheet": "Sheet1", "cell": "G2", "formula": "=SUM(B2:F2)", "overwrites": null}],
+  "cells": [{"sheet": "Sheet1", "cell": "G2", "formula": "=SUM(B2:F2)", "value": null, "overwrites": null}],
   "validation": {"ok": true, "errors": [], "warnings": [], "functions": ["SUM"], "refs": ["B2:F2"]},
   "predicted_value": "438",
   "clarification": null,
@@ -72,6 +72,7 @@ openpyxl 逐格读表 → 无损 TSV 文本化 → DeepSeek 判断表头并生�
 - `clarification` 非空：不要写入，把这个问题转述给用户并等待补充。
 - `ok=false`：把 `error` 或 `validation.errors` 用自然语言解释给用户，不要重试写入。
 - `predicted_value`：程序在本地独立算出的预期结果，可在确认时展示；为 `null` 时看 `predicted_note`。
+- `cells[].formula` 为空时是“值写入”：`value` 为直接写入的常量（如新建汇总表里的区域名），预览时把它一并展示给用户。
 - `applied`：只有真正写入后才非空，包含 `file`、`backup`、`count`。
 
 ## 示例

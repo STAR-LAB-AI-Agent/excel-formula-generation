@@ -92,3 +92,36 @@ def test_division_by_zero_returns_excel_error(sample_xlsx):
 def test_unsupported_function_raises(sample_xlsx):
     with pytest.raises(UnsupportedFormula):
         _eval(sample_xlsx, "=NETWORKDAYS(A2,A3)")
+
+
+def test_reverse_lookup_with_array_constant(tmp_path):
+    """IF({1,0},姓名列,编号列) 用数组常量翻转列顺序，让 VLOOKUP 能向左返回。"""
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Sheet1"
+    for row in [
+        ["编号", "姓名"],
+        ["A01048", "叶知"],
+        ["A02267", "陈佩亮"],
+    ]:
+        sheet.append(row)
+    path = tmp_path / "emp.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    # 姓名在右侧，仍可用 VLOOKUP 按姓名反查左侧编号
+    assert format_value(
+        _eval(path, '=VLOOKUP("陈佩亮",IF({1,0},B2:B3,A2:A3),2,0)')
+    ) == "A02267"
+    # 查不到时走精确匹配的 #N/A，而不是抛异常
+    assert format_value(
+        _eval(path, '=VLOOKUP("查无此人",IF({1,0},B2:B3,A2:A3),2,0)')
+    ) == "#N/A"
+
+
+def test_array_constant_literal_shapes(sample_xlsx):
+    """数组常量本身可以参与求和，分号分行、逗号分列。"""
+    assert format_value(_eval(sample_xlsx, "=SUM({1,2,3})")) == "6"
+    assert format_value(_eval(sample_xlsx, "=COUNT({1,2;3,4})")) == "4"

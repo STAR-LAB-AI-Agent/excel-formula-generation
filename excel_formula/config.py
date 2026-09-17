@@ -7,7 +7,7 @@ from pathlib import Path
 
 # ---------------------------------------------------------------- 模型相关默认值
 DEFAULT_BASE_URL = "https://api.deepseek.com/chat/completions"
-DEFAULT_MODEL = "deepseek-chat"
+DEFAULT_MODEL = "deepseek-flash"
 DEFAULT_TIMEOUT = 60
 DEFAULT_TEMPERATURE = 0.0
 # 校验失败后允许把错误信息回传模型重新生成的次数
@@ -29,7 +29,7 @@ DIGEST_MAX_COLUMNS = 40
 ALLOWED_FUNCTIONS: frozenset[str] = frozenset(
     """
     SUM SUMIF SUMIFS SUMPRODUCT SUBTOTAL PRODUCT
-    AVERAGE AVERAGEIF AVERAGEIFS MEDIAN MODE
+    AVERAGE AVERAGEIF AVERAGEIFS MEDIAN MODE MODE.SNGL
     COUNT COUNTA COUNTBLANK COUNTIF COUNTIFS
     MAX MAXIFS MIN MINIFS LARGE SMALL RANK RANK.EQ PERCENTILE QUARTILE
     STDEV STDEV.S STDEV.P STDEVP VAR VAR.S VAR.P
@@ -71,6 +71,22 @@ class SecurityError(RuntimeError):
     """越权访问：超出目录白名单或文件类型不被允许。"""
 
 
+def normalize_thinking(raw: str) -> str:
+    """把用户输入的思考开关归一到内部档位。
+
+    支持数字开关（1=深度思考常开，0=关闭思考）与英文别名；
+    环境变量 EXCELCR_THINKING 与交互命令 :think 共用这一套解析。
+    """
+    value = (raw or "").strip().lower()
+    if value in {"1", "on"}:
+        return "enabled"
+    if value in {"0", "off"}:
+        return "disabled"
+    if value in {"", "enabled", "disabled", "auto"}:
+        return value
+    raise ConfigError("思考开关只能是 1（深度思考）、0（关闭）、auto（按复杂度）或 on/off")
+
+
 def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
     """极简 .env 加载器：只处理 KEY=VALUE，不覆盖已存在的环境变量。"""
     env_path = Path(path)
@@ -96,6 +112,11 @@ class Settings:
     base_url: str = DEFAULT_BASE_URL
     timeout: int = DEFAULT_TIMEOUT
     temperature: float = DEFAULT_TEMPERATURE
+    # 思考模式与思考强度（DeepSeek V4.x）：空串表示不干预，由服务端默认决定
+    # thinking 三档：enabled=深度思考常开 / disabled=关闭（最快）/ auto=按复杂度自动
+    # 数字开关 1/0（含 on/off 别名）由 normalize_thinking 归一到上面三档
+    thinking: str = ""
+    reasoning_effort: str = ""
     max_repair_rounds: int = DEFAULT_MAX_REPAIR_ROUNDS
     # 显式代理地址（空表示不指定）；trust_env 为 False 时忽略系统/环境代理直连
     proxy: str = ""
@@ -114,12 +135,18 @@ class Settings:
             roots.insert(0, Path(workspace).expanduser().resolve())
         if not roots:
             roots = [Path.cwd().resolve()]
+        thinking = normalize_thinking(os.environ.get("EXCELCR_THINKING", ""))
+        effort = os.environ.get("EXCELCR_REASONING_EFFORT", "").strip().lower()
+        if effort and effort not in {"low", "high", "max"}:
+            raise ConfigError("EXCELCR_REASONING_EFFORT 只能是 low、high 或 max")
         return cls(
             api_key=os.environ.get("DEEPSEEK_API_KEY", "").strip(),
             model=os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL,
             base_url=os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL,
             timeout=int(os.environ.get("DEEPSEEK_TIMEOUT", DEFAULT_TIMEOUT)),
             temperature=float(os.environ.get("DEEPSEEK_TEMPERATURE", DEFAULT_TEMPERATURE)),
+            thinking=thinking,
+            reasoning_effort=effort,
             max_repair_rounds=int(os.environ.get("EXCELCR_MAX_REPAIR", DEFAULT_MAX_REPAIR_ROUNDS)),
             proxy=os.environ.get("EXCELCR_PROXY", "").strip(),
             trust_env=os.environ.get("EXCELCR_TRUST_ENV", "1") != "0",

@@ -35,6 +35,20 @@ def test_unbalanced_parenthesis():
     assert "右括号" in result.error_text()
 
 
+def test_array_constant_is_accepted():
+    # 反向 VLOOKUP 依赖 IF({1,0},…) 翻转列顺序，parser 与 evaluator 都支持
+    result, ast = validate_formula("=VLOOKUP(B2,IF({1,0},E2:E9,D2:D9),2,0)")
+    assert result.ok
+    assert result.errors == []
+    assert ast is not None
+
+
+def test_array_constant_rows_must_be_uniform():
+    result, _ = validate_formula("=SUM(IF({1,0;3},A1:A3,B1:B3))")
+    assert not result.ok
+    assert "数组常量" in result.error_text() and "元素个数" in result.error_text()
+
+
 def test_forbidden_function_rejected():
     result, _ = validate_formula('=INDIRECT("A1")')
     assert not result.ok

@@ -30,25 +30,31 @@ from .formula_parser import (
 ARITY: dict[str, tuple[int, int | None]] = {
     "SUM": (1, None), "AVERAGE": (1, None), "MAX": (1, None), "MIN": (1, None),
     "COUNT": (1, None), "COUNTA": (1, None), "COUNTBLANK": (1, 1), "PRODUCT": (1, None),
-    "MEDIAN": (1, None), "STDEV": (1, None), "STDEV.S": (1, None), "STDEV.P": (1, None),
+    "MEDIAN": (1, None), "MODE": (1, None), "MODE.SNGL": (1, None),
+    "STDEV": (1, None), "STDEV.S": (1, None), "STDEV.P": (1, None), "STDEVP": (1, None),
+    "VAR": (1, None), "VAR.S": (1, None), "VAR.P": (1, None),
     "COUNTIF": (2, 2), "SUMIF": (2, 3), "AVERAGEIF": (2, 3),
     "COUNTIFS": (2, None), "SUMIFS": (3, None), "AVERAGEIFS": (3, None),
+    "MAXIFS": (3, None), "MINIFS": (3, None),
     "IF": (2, 3), "IFERROR": (2, 2), "IFNA": (2, 2), "AND": (1, None), "OR": (1, None),
     "NOT": (1, 1), "XOR": (1, None), "SWITCH": (3, None), "IFS": (2, None),
     "ROUND": (1, 2), "ROUNDUP": (2, 2), "ROUNDDOWN": (2, 2), "INT": (1, 1), "TRUNC": (1, 2),
     "ABS": (1, 1), "SQRT": (1, 1), "POWER": (2, 2), "MOD": (2, 2), "SIGN": (1, 1),
     "EXP": (1, 1), "LN": (1, 1), "LOG": (1, 2), "LOG10": (1, 1),
+    "CEILING": (2, 2), "FLOOR": (2, 2),
     "LARGE": (2, 2), "SMALL": (2, 2), "RANK": (2, 3), "RANK.EQ": (2, 3),
-    "VLOOKUP": (3, 4), "HLOOKUP": (3, 4), "XLOOKUP": (3, 6), "INDEX": (2, 3),
-    "MATCH": (2, 3), "CHOOSE": (2, None), "OFFSET": (3, 5),
+    "VLOOKUP": (3, 4), "HLOOKUP": (3, 4), "XLOOKUP": (3, 6), "LOOKUP": (2, 3),
+    "INDEX": (2, 3), "MATCH": (2, 3), "CHOOSE": (2, None), "OFFSET": (3, 5),
     "LEN": (1, 1), "LEFT": (1, 2), "RIGHT": (1, 2), "MID": (3, 3),
     "FIND": (2, 3), "SEARCH": (2, 3), "SUBSTITUTE": (3, 4), "REPLACE": (4, 4),
     "TRIM": (1, 1), "UPPER": (1, 1), "LOWER": (1, 1), "PROPER": (1, 1),
     "TEXT": (2, 2), "VALUE": (1, 1), "TEXTJOIN": (3, None), "CONCAT": (1, None),
-    "CONCATENATE": (1, None), "REPT": (2, 2),
+    "CONCATENATE": (1, None), "REPT": (2, 2), "CHAR": (1, 1), "CODE": (1, 1),
     "TODAY": (0, 0), "NOW": (0, 0), "DATE": (3, 3), "YEAR": (1, 1), "MONTH": (1, 1),
     "DAY": (1, 1), "DATEDIF": (3, 3), "EOMONTH": (2, 2), "EDATE": (2, 2),
     "ISBLANK": (1, 1), "ISNUMBER": (1, 1), "ISTEXT": (1, 1), "ISERROR": (1, 1),
+    "ISERR": (1, 1), "ISNA": (1, 1), "ISEVEN": (1, 1), "ISODD": (1, 1), "NA": (0, 0),
+    "TRUE": (0, 0), "FALSE": (0, 0),
     "ROW": (0, 1), "COLUMN": (0, 1), "ROWS": (1, 1), "COLUMNS": (1, 1),
     "SUBTOTAL": (2, None), "SUMPRODUCT": (1, None), "RANDBETWEEN": (2, 2), "RAND": (0, 0),
 }
@@ -64,6 +70,8 @@ class ValidationResult:
     warnings: list[str] = field(default_factory=list)
     functions: list[str] = field(default_factory=list)
     refs: list[str] = field(default_factory=list)
+    # 错误属于“回传模型重试也修不好”的类别：命中即停止修复循环，不再白烧 Token
+    unrepairable: bool = False
 
     def error_text(self) -> str:
         return "；".join(self.errors)
@@ -93,7 +101,14 @@ def validate_formula(
     try:
         ast = parse_formula(formula)
     except FormulaSyntaxError as exc:
-        return ValidationResult(ok=False, errors=[f"语法错误: {exc}"]), None
+        return (
+            ValidationResult(
+                ok=False,
+                errors=[f"语法错误: {exc}"],
+                unrepairable=exc.code == "unsupported_syntax",
+            ),
+            None,
+        )
 
     nodes = list(walk(ast))
     functions = sorted({n.name for n in nodes if isinstance(n, FuncCall)})

@@ -22,7 +22,8 @@ _QUOTED_RE = re.compile(r"[\"'“”‘’《》]([^\"'“”‘’《》]+\.xls
 # 中文与字母之间没有 \b 边界（中文也算 \w），因此用显式的 ASCII 前后置断言
 _CELL_TOKEN = r"(?<![A-Za-z0-9$])(\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6})(?![A-Za-z0-9])"
 _SHEET_RE = re.compile(
-    r"(?:工作表|sheet|表)\s*[:：]?\s*"
+    # 裸“表”要排除“表格”这类常用词：“表格下方”里的“表”不是工作表前缀
+    r"(?:工作表|sheet|表(?!格))\s*[:：]?\s*"
     r"(?:[\"'“”‘’《]([^\"'“”‘’》]{1,31})[\"'“”‘’》]|([A-Za-z0-9_]{1,31})|([\u4e00-\u9fff]{1,12}))",
     re.IGNORECASE,
 )
@@ -30,7 +31,7 @@ _CELL_RE = re.compile(_CELL_TOKEN)
 _RANGE_RE = re.compile(_CELL_TOKEN + r"\s*[:：]\s*" + _CELL_TOKEN)
 # 工作表名里不会出现的动作词，命中即说明抓到的是后半句而不是表名
 _SHEET_STOP = ("里", "中", "的", "上", "内", "下", "这", "那", "有")
-_SHEET_VERBS = ("统计", "计算", "求", "算", "填", "写", "生成", "添加", "解释", "校验", "检查")
+_SHEET_VERBS = ("统计", "计算", "汇总", "求", "算", "填", "写", "生成", "添加", "解释", "校验", "检查")
 _TARGET_HINT_RE = re.compile(
     r"(?:写到|写入|放到|放在|填到|填入|存到|在)\s*([A-Za-z]{1,3}[1-9][0-9]{0,6})\s*(?:单元格|格子)?"
 )
@@ -122,6 +123,22 @@ def _extract_file(text: str) -> str | None:
     return plain.group(0) if plain else None
 
 
+def file_candidates(name: str) -> list[str]:
+    """中文里“在xxx.xlsx”没有空格分隔，抓到的文件名可能粘上了前面的介词。
+
+    汉字本身也是合法文件名（如 测试数据.xlsx），所以不能简单剔除汉字。
+    这里只逐字剥掉开头的汉字生成由长到短的候选，由调用方按文件是否真的存在来挑。
+    """
+    candidates = [name]
+    stem = name
+    while re.match(r"[\u4e00-\u9fff]", stem):
+        stem = stem[1:]
+        if stem.startswith("."):  # 再剥就只剩后缀了
+            break
+        candidates.append(stem)
+    return candidates
+
+
 def _extract_sheet(text: str) -> str | None:
     for match in _SHEET_RE.finditer(text):
         quoted, ascii_name, chinese = match.groups()
@@ -130,7 +147,8 @@ def _extract_sheet(text: str) -> str | None:
             # 中文表名容易把后半句一起吃进来，遇到停用字或动作词就截断
             for stop in _SHEET_STOP:
                 name = name.split(stop)[0]
-            if not name or any(verb in name for verb in _SHEET_VERBS):
+            # 截断后只剩单个汉字（如“表格下方”切出的“格”）几乎不可能是表名
+            if len(name) < 2 or any(verb in name for verb in _SHEET_VERBS):
                 continue
         if not name or name.lower().endswith((".xlsx", ".xlsm")):
             continue

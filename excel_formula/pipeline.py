@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .config import Settings
 from .evaluator import UnsupportedFormula, evaluate_formula, format_value
@@ -88,30 +89,42 @@ class Proposal:
             return f"未能生成可用公式：{self.error or '校验未通过'}"
 
         lines = [f"文件: {self.file.name}    工作表: {self.sheet}"]
-        # 模型一次给多个目标时逐行列出，否则保持原来的单行格式
-        anchors = [w for w in self.writes if w.explanation or w.predicted or w.predicted_note]
+        # 值写入恒列出内容；公式只列每个填充块的首格（其余落进下方的“填充”范围行）
+        anchors = [
+            w for w in self.writes
+            if not w.formula or w.explanation or w.predicted or w.predicted_note
+        ]
         if len(anchors) > 1:
             for item in anchors:
-                line = f"  {item.cell} = {item.formula}"
-                if item.predicted is not None:
-                    line += f"    预期结果: {item.predicted}"
-                elif item.predicted_note:
-                    line += f"    预期结果: 未验证（{item.predicted_note}）"
+                if item.formula:
+                    line = f"  {item.cell} = {item.formula}"
+                    if item.predicted is not None:
+                        line += f"    预期结果: {item.predicted}"
+                    elif item.predicted_note:
+                        line += f"    预期结果: 未验证（{item.predicted_note}）"
+                else:
+                    line = f"  {item.cell} = {item.value}（值）"
                 lines.append(line)
                 if item.explanation:
                     lines.append(f"      说明: {item.explanation}")
             lines.append("（预期结果为本地独立计算，未写入文件）")
         else:
-            lines.append(f"目标: {self.target}    公式: {self.formula}")
+            first = self.writes[0] if self.writes else None
+            is_value = first is not None and not first.formula
+            if is_value:
+                lines.append(f"目标: {self.target}    值: {first.value}")
+            else:
+                lines.append(f"目标: {self.target}    公式: {self.formula}")
             if self.explanation:
                 lines.append(f"说明: {self.explanation}")
-            if self.predicted is not None:
-                lines.append(f"预期结果: {self.predicted}（本地独立计算，未写入文件）")
-            elif self.predicted_note:
-                lines.append(f"预期结果: 未验证（{self.predicted_note}）")
-        if len(self.writes) > len(anchors):
-            tail = self.writes[-1]
-            lines.append(f"填充: {self.target} → {tail.cell}（共 {len(self.writes)} 个单元格）")
+            if not is_value:
+                if self.predicted is not None:
+                    lines.append(f"预期结果: {self.predicted}（本地独立计算，未写入文件）")
+                elif self.predicted_note:
+                    lines.append(f"预期结果: 未验证（{self.predicted_note}）")
+        # 自动填充的单元格按连续段报告范围（同时填充多列时不会合并成误导的大范围）
+        for span in self._fill_spans(anchors):
+            lines.append(f"填充: {span[0]} → {span[-1]}（共 {len(span)} 个单元格）")
         overwrite = [w for w in self.writes if w.old_formula or w.old_value is not None]
         if overwrite:
             preview = ", ".join(
@@ -125,6 +138,32 @@ class Proposal:
         if len(self.attempts) > 1:
             lines.append(f"（经过 {len(self.attempts)} 次生成，前 {len(self.attempts) - 1} 次校验未通过）")
         return "\n".join(lines)
+
+    def _fill_spans(self, anchors: list[CellWrite]) -> list[list[str]]:
+        """自动填充格子按连续段分组；返回每段单元格列表（单格段与空段剔除）。"""
+        anchor_ids = {id(w) for w in anchors}
+        spans: list[list[str]] = []
+        current: list[str] = []
+        for item in self.writes:
+            if id(item) in anchor_ids or not item.formula:
+                # 锚点或值写入会打断填充段
+                if current:
+                    spans.append(current)
+                current = []
+            else:
+                current.append(item.cell)
+        if current:
+            spans.append(current)
+        return [span for span in spans if len(span) > 1]
+
+
+# EXCELCR_THINKING=auto 时的"复杂需求"关键词：命中即保留思考模式
+_COMPLEX_SIGNALS = (
+    "跨表", "另一张", "多条件", "同时满足", "并且", "嵌套", "查找", "匹配",
+    "排名", "占比", "百分比", "累计", "环比", "同比", "汇总", "分档", "评级",
+)
+# 值写入（分类名、标题等常量）的长度上限：防止模型把整段说明塞进单元格
+_MAX_VALUE_LENGTH = 200
 
 
 class FormulaService:
@@ -158,6 +197,7 @@ class FormulaService:
         *,
         sheet: str | None = None,
         target: str | None = None,
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> Proposal:
         path = self.settings.resolve_path(file)
         if not request or not request.strip():
@@ -177,9 +217,16 @@ class FormulaService:
             )
 
             for round_index in range(self.settings.max_repair_rounds + 1):
+                # 传了回调才走流式；不传时保持一次性返回，兼容程序化调用与测试替身
+                chat_kwargs: dict = {"on_delta": on_delta} if on_delta is not None else {}
+                if self.settings.thinking == "auto":
+                    # auto 档：简单需求跳过思考提速；首轮失败后自动升级为思考再修
+                    chat_kwargs["thinking"] = self._auto_thinking(request, digest, round_index)
                 try:
-                    result = self.client.chat(messages)
+                    result = self.client.chat(messages, **chat_kwargs)
                 except LLMError as exc:
+                    if exc.usage:  # 输出被截断等失败仍占用了 Token，不能漏算
+                        proposal.usage.add(exc.usage)
                     proposal.error = str(exc)
                     if self.logger:
                         self.logger.error("模型调用失败：%s", exc)
@@ -215,13 +262,27 @@ class FormulaService:
                     formula = candidate["formula"]
                     cell = candidate["target"] or (target if index == 0 else None)
                     if not cell:
-                        proposal.clarification = "请告诉我把公式写到哪个单元格，例如 G2。"
+                        proposal.clarification = "请告诉我把内容写到哪个单元格，例如 G2。"
                         return proposal
                     cell = cell.upper()
                     if cell in seen:
-                        errors.append(f"{cell}: 同一单元格被指定了多个公式")
+                        errors.append(f"{cell}: 同一单元格被指定了多个写入")
                         continue
                     seen.add(cell)
+
+                    if not formula:
+                        # 值写入：分类名、标题等已知常量，无需公式校验
+                        try:
+                            accepted.append(
+                                self._build_value_write(
+                                    view, sheet_name, cell,
+                                    candidate.get("value"), candidate["explanation"],
+                                )
+                            )
+                        except ValueError as exc:
+                            prefix = f"{cell}: " if labelled else ""
+                            errors.append(prefix + str(exc))
+                        continue
 
                     one, cell_errors = self._check_candidate(
                         view, sheet_name, digest, cell, formula, candidate.get("fill_to")
@@ -256,9 +317,13 @@ class FormulaService:
                             "第 %d 次校验失败 formulas=%s errors=%s",
                             round_index + 1, formulas, errors,
                         )
-                    if round_index >= self.settings.max_repair_rounds:
+                    # 命中“重试也修不好”的错误类别：直接收手，不再白烧一轮 Token
+                    unrepairable = validation is not None and validation.unrepairable
+                    if unrepairable or round_index >= self.settings.max_repair_rounds:
                         proposal.validation = validation
                         proposal.error = "；".join(errors)
+                        if unrepairable:
+                            proposal.error += "。该写法本地不支持，重试无法解决，已停止"
                         return proposal
                     messages = messages + [
                         {"role": "assistant", "content": result.content},
@@ -329,6 +394,7 @@ class FormulaService:
         file: str | Path | None = None,
         sheet: str | None = None,
         cell: str | None = None,
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> dict:
         digest_text = None
         resolved_formula = (formula or "").strip()
@@ -349,8 +415,15 @@ class FormulaService:
 
         # 先本地校验一次，静态问题不必花 Token 就能告知用户
         validation, _ = validate_formula(resolved_formula)
+        chat_kwargs = {"on_delta": on_delta} if on_delta is not None else {}
+        if self.settings.thinking == "auto":
+            # 短公式直译即可；嵌套较深的公式才值得开思考
+            chat_kwargs["thinking"] = "enabled" if len(resolved_formula) >= 60 else "disabled"
         result = self.client.chat(
-            build_explain_messages(resolved_formula, digest_text), json_mode=False, max_tokens=500
+            build_explain_messages(resolved_formula, digest_text),
+            json_mode=False,
+            max_tokens=1200,
+            **chat_kwargs,
         )
         if self.logger:
             self.logger.info("解释公式 formula=%s", resolved_formula)
@@ -396,6 +469,22 @@ class FormulaService:
         return apply_writes(path, writes, self.settings, logger=self.logger, output=out_path)
 
     # ============================================================ 内部方法
+    def _auto_thinking(self, request: str, digest: SheetDigest, round_index: int) -> str:
+        """EXCELCR_THINKING=auto 的复杂度启发式：简单直算跳过思考省时间，复杂需求保留思考。
+
+        硬信号优先：修复轮次（上一轮没过本地校验，说明问题不简单）、表格规模
+        （大表定位数据区更容易出错）；需求侧看长度与复杂关键词。
+        """
+        if round_index > 0:
+            return "enabled"
+        if len(request) >= 24:
+            return "enabled"
+        if digest.max_row > 40 or digest.max_column > 12:
+            return "enabled"
+        if any(word in request for word in _COMPLEX_SIGNALS):
+            return "enabled"
+        return "disabled"
+
     def _check_candidate(
         self,
         view: WorkbookView,
@@ -435,6 +524,15 @@ class FormulaService:
             )
         return validation, errors
 
+    def _mark_old_content(self, view: WorkbookView, sheet_name: str, item: CellWrite) -> None:
+        """记录目标单元格当前内容，供预览里的覆盖提醒使用。"""
+        _, col, row = parse_target(item.cell)
+        raw = view.formula_sheet(sheet_name).cell(row=row, column=col).value
+        if isinstance(raw, str) and raw.startswith("="):
+            item.old_formula = raw
+        else:
+            item.old_value = view.value_sheet(sheet_name).cell(row=row, column=col).value
+
     def _build_writes(
         self,
         view: WorkbookView,
@@ -444,16 +542,33 @@ class FormulaService:
         fill_to: str | None,
     ) -> list[CellWrite]:
         writes = expand_fill(sheet_name, target, formula, fill_to)
-        ws_f = view.formula_sheet(sheet_name)
-        ws_v = view.value_sheet(sheet_name)
         for item in writes:
-            _, col, row = parse_target(item.cell)
-            raw = ws_f.cell(row=row, column=col).value
-            if isinstance(raw, str) and raw.startswith("="):
-                item.old_formula = raw
-            else:
-                item.old_value = ws_v.cell(row=row, column=col).value
+            self._mark_old_content(view, sheet_name, item)
         return writes
+
+    def _build_value_write(
+        self,
+        view: WorkbookView,
+        sheet_name: str,
+        cell: str,
+        value: object,
+        explanation: str,
+    ) -> CellWrite:
+        """值写入：把已知常量（区域名、标题等）直接写入单元格，不经过公式校验。"""
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise ValueError("value 只能是文本或数字")
+        if isinstance(value, str):
+            if not value.strip():
+                raise ValueError("常量值不能为空")
+            if value.startswith("="):
+                raise ValueError("常量值不能以 = 开头，公式请使用 formula 字段")
+            if len(value) > _MAX_VALUE_LENGTH:
+                raise ValueError(f"常量值超过 {_MAX_VALUE_LENGTH} 字，疑似把说明文字写进了单元格")
+        write = CellWrite(sheet=sheet_name, cell=cell, formula="", value=value)
+        write.explanation = explanation
+        write.predicted = str(value)
+        self._mark_old_content(view, sheet_name, write)
+        return write
 
     def _predict(
         self, view: WorkbookView, sheet_name: str, formula: str
@@ -481,6 +596,7 @@ def _merge_validation(
     base.ok = base.ok and extra.ok
     base.errors.extend(extra.errors)
     base.warnings.extend(extra.warnings)
+    base.unrepairable = base.unrepairable or extra.unrepairable
     base.functions.extend(f for f in extra.functions if f not in base.functions)
     base.refs.extend(r for r in extra.refs if r not in base.refs)
     return base

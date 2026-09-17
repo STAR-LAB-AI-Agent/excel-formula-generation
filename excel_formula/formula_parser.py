@@ -13,12 +13,17 @@ from .config import MAX_EXCEL_COLUMN, MAX_EXCEL_ROW
 
 
 class FormulaSyntaxError(ValueError):
-    """公式语法错误，携带出错位置以便回传模型修复。"""
+    """公式语法错误，携带出错位置以便回传模型修复。
 
-    def __init__(self, message: str, position: int = -1):
+    ``code`` 用于标记“重试也无法解决”的类别（本地语法不支持的写法），
+    便于上层提前终止修复循环、不再白烧 Token。
+    """
+
+    def __init__(self, message: str, position: int = -1, code: str | None = None):
         super().__init__(message if position < 0 else f"{message}（位置 {position}）")
         self.message = message
         self.position = position
+        self.code = code
 
 
 # ------------------------------------------------------------------ AST 节点
@@ -79,6 +84,13 @@ class DefinedName:
 
 
 @dataclass
+class ArrayLiteral:
+    """数组常量，如 {1,0}；rows 为按行组织的标量二维列表。"""
+
+    rows: list
+
+
+@dataclass
 class FuncCall:
     name: str
     args: list = field(default_factory=list)
@@ -126,6 +138,8 @@ TOKEN_RE = re.compile(
     | (?P<percent>%)
     | (?P<lparen>\()
     | (?P<rparen>\))
+    | (?P<lbrace>\x7b)
+    | (?P<rbrace>\x7d)
     | (?P<sep>[,;])
     | (?P<name>[A-Za-z_\u4e00-\u9fff\[][A-Za-z0-9_.\u4e00-\u9fff\[\]]*)
     """,
@@ -141,7 +155,16 @@ def tokenize(formula: str) -> list[Token]:
     while pos < length:
         match = TOKEN_RE.match(formula, pos)
         if match is None:
-            raise FormulaSyntaxError(f"无法识别的字符 {formula[pos]!r}", pos + 1)
+            char = formula[pos]
+            # 模型常用 IF({1,0},E:E,D:D) 这类数组常量做“反向 VLOOKUP”，本地解析器不支持；
+            # 单独报“无法识别 '{'”既看不懂又会误导模型反复重试，故单独标记
+            if char in "{}":
+                raise FormulaSyntaxError(
+                    "不支持数组常量 {…}（如 IF({1,0},…) 这类反向 VLOOKUP 写法）",
+                    pos + 1,
+                    code="array_constant",
+                )
+            raise FormulaSyntaxError(f"无法识别的字符 {char!r}", pos + 1)
         kind = match.lastgroup
         # func 分组带有 lookahead，lastgroup 可能落在内部分组上，统一用 groupdict 判断
         if kind is None or match.group(kind) is None:
@@ -278,6 +301,8 @@ class Parser:
             node = self.parse_comparison()
             self.expect("rparen", "右括号 )")
             return node
+        if kind == "lbrace":
+            return self._parse_array()
         if kind == "sheet":
             sheet = _clean_sheet(token.text)
             nxt = self.peek()
@@ -305,6 +330,40 @@ class Parser:
 
         raise FormulaSyntaxError(f"意外的符号 {token.text!r}", token.position)
 
+    # ------------------------------------------------------------ 数组常量
+    def _parse_array(self) -> ArrayLiteral:
+        """解析 {1,0} / {1,0;3,4} 这类数组常量：逗号分列、分号分行。
+
+        反向 VLOOKUP 依赖 IF({1,0},E:E,D:D) 把列顺序临时翻转过来。
+        """
+        rows: list[list] = []
+        while True:
+            row: list[object] = [self._parse_array_item()]
+            while self.accept("sep", ","):
+                row.append(self._parse_array_item())
+            rows.append(row)
+            if self.accept("sep", ";"):
+                continue
+            break
+        self.expect("rbrace", "右花括号 }")
+        width = len(rows[0])
+        if any(len(row) != width for row in rows[1:]):
+            raise FormulaSyntaxError("数组常量各行的元素个数必须相同")
+        return ArrayLiteral(rows)
+
+    def _parse_array_item(self) -> object:
+        """数组常量里只允许标量字面量，且数量有限，避免退化成任意表达式。"""
+        token = self.next()
+        if token.kind == "number":
+            return Number(float(token.text))
+        if token.kind == "string":
+            return Text(token.text[1:-1].replace('""', '"'))
+        if token.kind == "bool":
+            return Bool(token.text.upper() == "TRUE")
+        raise FormulaSyntaxError(
+            f"数组常量的元素必须是数字或文本，实际是 {token.text!r}", token.position
+        )
+
 
 def parse_formula(formula: str) -> object:
     """解析完整公式（必须以 = 开头），返回 AST 根节点。"""
@@ -329,6 +388,10 @@ def walk(node: object):
     if isinstance(node, FuncCall):
         for arg in node.args:
             yield from walk(arg)
+    elif isinstance(node, ArrayLiteral):
+        for row in node.rows:
+            for item in row:
+                yield from walk(item)
     elif isinstance(node, Binary):
         yield from walk(node.left)
         yield from walk(node.right)

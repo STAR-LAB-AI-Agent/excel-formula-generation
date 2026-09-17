@@ -9,21 +9,25 @@
 """
 from __future__ import annotations
 
+import re
 import sys
+import time
 from pathlib import Path
 
-from excel_formula.config import ConfigError, SecurityError, Settings
+from excel_formula.config import ConfigError, SecurityError, Settings, normalize_thinking
 from excel_formula.evaluator import UnsupportedFormula
 from excel_formula.formula_parser import FormulaSyntaxError
 from excel_formula.intent import (
     INTENT_DESCRIBE,
     INTENT_EXPLAIN,
+    INTENT_GENERATE,
     INTENT_VALIDATE,
     classify,
+    file_candidates,
 )
 from excel_formula.llm_client import LLMError
 from excel_formula.logger import get_logger
-from excel_formula.pipeline import FormulaService
+from excel_formula.pipeline import FormulaService, Proposal
 
 BANNER = """
 ============================================================
@@ -35,7 +39,7 @@ BANNER = """
     · 这个表有哪些列？
     · =SUMIF(B2:B6,">85") 这个公式对不对？
     · 解释一下 G2 里的公式
-  指令：:file <路径>  :sheet <表名>  :info  :help  :quit
+  指令：:file <路径>  :sheet <表名>  :think <1|0|auto>  :info  :help  :quit
 ============================================================
 """
 
@@ -43,11 +47,103 @@ HELP = """
 可用指令：
   :file <路径>   切换当前 Excel 文件（仅允许工作目录内的 .xlsx/.xlsm）
   :sheet <表名>  指定工作表（默认取第一张有数据的表）
+  :think <档位>  思考模式：1 深度思考常开 / 0 关闭（最快）/ auto 自动；不带参数看当前
   :info          查看当前文件结构（不消耗 Token）
   :help          显示帮助
   :quit / :exit  退出
 其他输入按自然语言处理；写文件前一定会先预览并请你确认。
 """
+
+# 剔除文件名后剩下的标点/空白，不算需求内容
+_FILLER_RE = re.compile(r"[\s\"'“”‘’，,。；;：:、（）()]+")
+
+
+def _is_bare_file_reference(text: str, file: str | None) -> bool:
+    """只报了个文件名、没说要算什么。
+
+    这类输入以前会把文件名本身当成需求发给模型，模型只能反复猜用户想干什么，
+    白花 Token 还容易把额度耗在思考上导致返回空内容。
+    """
+    if not file:
+        return False
+    return not _FILLER_RE.sub("", text.replace(file, " "))
+
+
+def _display_width(text: str) -> int:
+    """估算终端显示宽度：CJK 字符按 2 列计，用于进度行重绘时补空格对齐。"""
+    return sum(2 if ord(ch) > 0x2E7F else 1 for ch in text)
+
+
+class _StreamProgress:
+    """流式生成期间的一行原地刷新进度；非交互终端自动静默。
+
+    思考型模型（DeepSeek V4.x 默认开启思考）可能几十秒里只输出思维链，
+    这个进度行让用户明确知道模型还在工作。
+    """
+
+    def __init__(self, interval: float = 0.2) -> None:
+        self.enabled = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        self._interval = interval
+        self._thinking = 0
+        self._body = 0
+        self._started = time.perf_counter()
+        self._last_paint = 0.0
+        self._painted_width = 0
+
+    def __call__(self, piece: str, kind: str) -> None:
+        if kind == "reasoning":
+            self._thinking += len(piece)
+        else:
+            self._body += len(piece)
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        if now - self._last_paint < self._interval:
+            return  # 高频分片按固定节奏合并重绘，避免刷屏
+        self._last_paint = now
+        self._paint(
+            f"… 模型思考 {self._thinking} 字 / 正文 {self._body} 字，已用 {now - self._started:.0f}s"
+        )
+
+    def _paint(self, message: str) -> None:
+        width = _display_width(message)
+        padding = " " * max(0, self._painted_width - width)
+        print(f"\r{message}{padding}", end="", flush=True)
+        self._painted_width = width
+
+    def finish(self) -> None:
+        """清掉进度行，把终端交还给正常输出。"""
+        if self._painted_width:
+            print("\r" + " " * self._painted_width + "\r", end="", flush=True)
+            self._painted_width = 0
+
+
+_THINKING_LABELS = {
+    "enabled": "深度思考常开（最准也最慢）",
+    "disabled": "关闭思考（最快）",
+    "auto": "自动（按需求复杂度切换）",
+    "": "服务端默认（思考开启、强度 high）",
+}
+
+
+def apply_thinking_command(settings: Settings, arg: str) -> str:
+    """处理 :think 交互命令：更新 settings.thinking 并返回反馈文本。
+
+    1/on=深度思考常开，0/off=关闭思考（最快），auto=按复杂度自动；
+    不带参数时只报告当前档位。改动立即生效，client 与 pipeline 共享同一份 settings。
+    """
+    current = _THINKING_LABELS.get(settings.thinking, settings.thinking)
+    if not arg.strip():
+        return (
+            f"当前思考模式：{current}；"
+            "用法：:think 1 深度思考 / :think 0 关闭（最快）/ :think auto 自动"
+        )
+    try:
+        value = normalize_thinking(arg)
+    except ConfigError as exc:
+        return f"× {exc}（当前仍为：{current}）"
+    settings.thinking = value
+    return f"√ 思考模式已切换：{_THINKING_LABELS.get(value, value)}"
 
 
 class Console:
@@ -78,10 +174,19 @@ class Console:
         return self._set_file(answer)
 
     def _set_file(self, raw: str) -> Path | None:
-        try:
-            path = self.settings.resolve_path(raw)
-        except (SecurityError, FileNotFoundError) as exc:
-            print(f"× {exc}")
+        if not raw.strip():
+            # 空参数会解析到工作目录本身，报出“收到：ExcelCR”这种误导信息，直接给用法
+            print("? 用法：:file <文件名>，例如 :file 销售数据.xlsx")
+            return None
+        path, first_error = None, None
+        for candidate in file_candidates(raw):
+            try:
+                path = self.settings.resolve_path(candidate)
+                break
+            except (SecurityError, FileNotFoundError) as exc:
+                first_error = first_error or exc
+        if path is None:
+            print(f"× {first_error}")
             return None
         self.current_file = path
         self.current_sheet = None
@@ -92,6 +197,8 @@ class Console:
     def run(self, once: str | None = None) -> int:
         if not once:
             print(BANNER)
+            current = _THINKING_LABELS.get(self.settings.thinking, self.settings.thinking)
+            print(f"思考模式：{current}（:think 1/0/auto 随时切换）")
             if self.current_file:
                 print(f"当前文件：{self.current_file.name}（用 :file 可切换）\n")
             if not self.settings.api_key:
@@ -122,6 +229,9 @@ class Console:
                 self.current_sheet = line[6:].strip() or None
                 print(f"√ 当前工作表：{self.current_sheet or '自动'}")
                 continue
+            if line == ":think" or line.startswith(":think "):
+                print(apply_thinking_command(self.settings, line[6:].strip()))
+                continue
             if line == ":info":
                 self.show_info()
                 continue
@@ -130,8 +240,12 @@ class Console:
     # -------------------------------------------------------------- 意图分发
     def handle(self, text: str) -> bool:
         intent = classify(text)
-        if intent.file:
-            self._set_file(intent.file)
+        if intent.file and not self._set_file(intent.file):
+            # 指定的文件没能打开时直接停下，不能默默拿上一个（或启动时自动猜的）文件继续
+            return False
+        if intent.kind == INTENT_GENERATE and _is_bare_file_reference(text, intent.file):
+            print("? 还不知道要算什么，请把需求说出来，例如「在G2算每个人的总分」。")
+            return True
         sheet = intent.sheet or self.current_sheet
         path = self._need_file()
         if not path:
@@ -177,7 +291,7 @@ class Console:
 
     def do_generate(self, path: Path, request: str, sheet: str | None, target: str | None) -> None:
         print("… 正在读取表结构并生成公式")
-        proposal = self.service.propose(path, request, sheet=sheet, target=target)
+        proposal = self._propose_with_progress(path, request, sheet, target)
 
         if proposal.clarification:
             print(f"? {proposal.clarification}")
@@ -187,7 +301,7 @@ class Console:
                 return
             merged = f"{request}（补充：{extra}）"
             new_target = target or classify(extra).target
-            proposal = self.service.propose(path, merged, sheet=sheet, target=new_target)
+            proposal = self._propose_with_progress(path, merged, sheet, new_target)
             if proposal.clarification:
                 print(f"? 仍缺少信息：{proposal.clarification}")
                 return
@@ -214,6 +328,22 @@ class Console:
             print(f"  原文件已备份：{Path(applied['backup']).name}")
         print("  日志：logs/excelcr.log")
 
+    def _propose_with_progress(
+        self, path: Path, request: str, sheet: str | None, target: str | None
+    ) -> Proposal:
+        """调用 propose 并展示流式进度；非交互终端自动退回静默等待。"""
+        progress = _StreamProgress()
+        try:
+            return self.service.propose(
+                path,
+                request,
+                sheet=sheet,
+                target=target,
+                on_delta=progress if progress.enabled else None,
+            )
+        finally:
+            progress.finish()
+
     def do_validate(self, path: Path, formula: str | None, sheet: str | None, target: str | None) -> None:
         if not formula:
             formula = input("要校验哪个公式？（以 = 开头）> ").strip()
@@ -239,7 +369,17 @@ class Console:
     def do_explain(self, path: Path, formula: str | None, sheet: str | None, cell: str | None) -> None:
         if not formula and not cell:
             cell = input("要解释哪个单元格的公式？（如 G2）> ").strip().upper() or None
-        result = self.service.explain(formula, file=path, sheet=sheet, cell=cell)
+        progress = _StreamProgress()
+        try:
+            result = self.service.explain(
+                formula,
+                file=path,
+                sheet=sheet,
+                cell=cell,
+                on_delta=progress if progress.enabled else None,
+            )
+        finally:
+            progress.finish()
         print(f"\n公式：{result['formula']}\n{result['explanation']}")
         if not result["validation"]["ok"]:
             print("注意：" + "；".join(result["validation"]["errors"]))
