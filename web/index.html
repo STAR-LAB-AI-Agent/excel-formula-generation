@@ -1,0 +1,1408 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ExcelCR · AI Excel 公式生成演示台</title>
+<style>
+/* ============================================================== 基础变量 */
+:root {
+  --bg: #0b0e14;
+  --panel: #11151f;
+  --panel-2: #161b26;
+  --panel-3: #1c2230;
+  --border: #242c3d;
+  --text: #dbe2f0;
+  --muted: #7c8698;
+  --faint: #55607a;
+  --accent: #4f7dff;
+  --accent-soft: rgba(79, 125, 255, .13);
+  --green: #3fb950;
+  --green-soft: rgba(63, 185, 80, .14);
+  --yellow: #d2a53a;
+  --yellow-soft: rgba(210, 165, 58, .13);
+  --red: #f0524f;
+  --red-soft: rgba(240, 82, 79, .12);
+  --mono: "Cascadia Code", Consolas, "JetBrains Mono", "Courier New", monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+button { font: inherit; cursor: pointer; border: none; background: none; color: inherit; }
+[hidden] { display: none !important; }
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: #2a3346; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #374259; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ============================================================== 顶栏 */
+header {
+  display: flex; align-items: center; gap: 18px;
+  padding: 0 20px; height: 54px; flex: none;
+  background: linear-gradient(180deg, #121826, #0e1320);
+  border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 15.5px; }
+.brand .logo {
+  width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center;
+  background: linear-gradient(135deg, #21a366, #107c41); font-size: 13px; color: #fff;
+}
+.brand small { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 2px; }
+.chips { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px; font-size: 12px;
+  background: var(--panel-3); color: var(--muted); border: 1px solid var(--border);
+}
+.chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+.chip .dot.dim { background: var(--faint); }
+.chip .dot.warn { background: var(--yellow); }
+.think-switch { display: flex; gap: 2px; padding: 3px; border-radius: 9px; background: #0a0d15; border: 1px solid var(--border); }
+.think-switch button {
+  padding: 3px 11px; border-radius: 6px; font-size: 12px; color: var(--muted);
+  transition: all .15s;
+}
+.think-switch button:hover { color: var(--text); }
+.think-switch button.on { background: var(--accent); color: #fff; box-shadow: 0 1px 6px rgba(79,125,255,.4); }
+
+/* ============================================================== 三栏布局 */
+main { flex: 1; display: flex; min-height: 0; }
+.col { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.col-chat { flex: 0 0 clamp(330px, 25vw, 470px); }
+.col-sheet { flex: 1; border-right: 1px solid var(--border); }
+.col-side { width: 292px; flex: none; background: #0e1220; border-right: 1px solid var(--border); }
+.col-head {
+  flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; border-bottom: 1px solid var(--border);
+  font-size: 12.5px; color: var(--muted); font-weight: 600; letter-spacing: .4px;
+}
+.col-head .spacer { margin-left: auto; }
+
+/* ============================================================== 右栏：对话 */
+.messages { flex: 1; overflow-y: auto; padding: 16px 16px 8px; scroll-behavior: smooth; }
+.msg { margin-bottom: 14px; display: flex; }
+.msg.user { justify-content: flex-end; }
+.bubble {
+  max-width: 86%; padding: 9px 13px; border-radius: 13px 13px 3px 13px;
+  background: linear-gradient(135deg, #2c4bb8, #3a5ce0); color: #fff;
+  font-size: 13.5px; white-space: pre-wrap; word-break: break-word;
+  box-shadow: 0 3px 14px rgba(58, 92, 224, .25);
+}
+.card {
+  width: 100%; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 12px; padding: 12px 13px; font-size: 13px;
+}
+.stages { display: flex; flex-direction: column; gap: 4px; }
+.stage {
+  display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px;
+  animation: fadein .25s ease;
+}
+.stage .sdot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
+.stage.done .sdot { background: var(--green); }
+.stage .zero { color: var(--green); font-size: 11.5px; }
+
+/* 思考链打字机 */
+.pane { margin-top: 10px; border-radius: 10px; overflow: hidden; border: 1px solid var(--border); }
+.pane-head {
+  display: flex; align-items: center; gap: 8px; padding: 6px 11px;
+  font-size: 12px; color: var(--muted); background: var(--panel-2);
+  border-bottom: 1px solid var(--border); cursor: pointer; user-select: none;
+}
+.pane-head .count { margin-left: auto; font-family: var(--mono); font-size: 11px; }
+.pane.pane-think .pane-head { color: #a8b3cb; }
+.pane.pane-think .pulse {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none;
+  animation: pulse 1s ease infinite;
+}
+.pane.pane-think.done .pulse { animation: none; background: var(--faint); }
+.pane-body {
+  max-height: 240px; overflow-y: auto; padding: 9px 12px;
+  font-family: var(--mono); font-size: 12px; line-height: 1.75;
+  white-space: pre-wrap; word-break: break-word;
+}
+.pane.pane-think .pane-body { color: #8fa0c4; background: #0d1119; }
+.pane.pane-out .pane-body { color: #b9e4c9; background: #0c1410; }
+.pane.collapsed .pane-body { display: none; }
+.caret { display: inline-block; width: 7px; height: 13px; background: var(--accent); vertical-align: -2px; animation: blink .9s step-end infinite; }
+.status-line { margin-top: 8px; font-size: 11.5px; color: var(--faint); font-family: var(--mono); }
+
+/* 结果卡片 */
+.result-card {
+  margin-top: 10px; border-radius: 10px; padding: 11px 12px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  animation: fadein .3s ease;
+}
+.result-card.ok { border-color: rgba(63, 185, 80, .4); }
+.result-card.bad { border-color: rgba(240, 82, 79, .45); }
+.rc-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.rc-title { font-weight: 700; font-size: 13px; }
+.badge {
+  padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; flex: none;
+}
+.badge.ok { background: var(--green-soft); color: var(--green); }
+.badge.bad { background: var(--red-soft); color: var(--red); }
+.badge.zero { background: var(--green-soft); color: var(--green); }
+.badge.token { background: var(--accent-soft); color: #8fb0ff; font-family: var(--mono); font-weight: 400; }
+.badge.warn { background: var(--yellow-soft); color: var(--yellow); }
+.rc-formula {
+  display: flex; align-items: baseline; gap: 8px; margin: 7px 0;
+  padding: 9px 11px; border-radius: 8px; background: #0b0f18;
+  border: 1px solid var(--border); font-family: var(--mono); font-size: 13px;
+  overflow-x: auto;
+}
+.rc-formula .cellref { color: var(--yellow); flex: none; }
+.rc-formula code { color: #7ec8ff; white-space: pre; }
+.rc-line { margin: 4px 0; font-size: 12.5px; color: #b7c1d6; }
+.rc-line .lbl { color: var(--muted); }
+.rc-line.hl { color: var(--green); font-weight: 600; }
+.rc-line.hl .muted { color: var(--muted); font-weight: 400; font-size: 11.5px; }
+.rc-warn { margin: 6px 0; font-size: 12.5px; color: var(--yellow); }
+.rc-err { margin: 5px 0; font-size: 12.5px; color: var(--red); white-space: pre-wrap; }
+.rc-list { margin: 6px 0; max-height: 190px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; }
+.rc-list table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+.rc-list td { padding: 4px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.rc-list tr:last-child td { border-bottom: none; }
+.rc-list td.cell { color: var(--yellow); width: 62px; white-space: nowrap; }
+.rc-list td.exp { color: var(--muted); font-family: inherit; font-size: 12px; }
+.rc-more { color: var(--muted); font-size: 11.5px; margin-top: 3px; }
+details.rc-details { margin-top: 7px; }
+details.rc-details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+details.rc-details summary:hover { color: var(--text); }
+details.rc-details .det-body {
+  margin-top: 6px; padding: 8px 10px; border-radius: 8px;
+  background: #0b0f18; border: 1px solid var(--border);
+  font-family: var(--mono); font-size: 11.5px; color: #9fb0cc;
+  white-space: pre-wrap; max-height: 200px; overflow-y: auto;
+}
+.rc-actions { display: flex; gap: 9px; margin-top: 11px; }
+.btn {
+  padding: 7px 17px; border-radius: 8px; font-size: 13px; font-weight: 600;
+  transition: all .15s; border: 1px solid transparent;
+}
+.btn.primary { background: linear-gradient(135deg, #21a366, #17914f); color: #fff; box-shadow: 0 3px 12px rgba(33, 163, 102, .3); }
+.btn.primary:hover { filter: brightness(1.12); }
+.btn.ghost { border-color: var(--border); color: var(--muted); }
+.btn.ghost:hover { color: var(--text); border-color: var(--faint); }
+.btn:disabled { opacity: .45; cursor: not-allowed; filter: none; }
+.written-banner {
+  display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-radius: 9px;
+  background: var(--green-soft); color: var(--green); font-weight: 600; font-size: 13px;
+}
+
+/* 输入区 */
+.composer { flex: none; border-top: 1px solid var(--border); padding: 10px 14px 13px; background: #0e1220; }
+.composer-hint { color: var(--faint); font-size: 12px; line-height: 1.7; margin-bottom: 9px; }
+.composer-hint b { color: var(--muted); font-weight: 500; }
+.sample {
+  padding: 3.5px 11px; border-radius: 999px; font-size: 12px; color: var(--muted);
+  background: var(--panel-3); border: 1px solid var(--border); transition: all .15s;
+}
+.sample:hover { color: #9fb6ff; border-color: var(--accent); background: var(--accent-soft); }
+.sample:disabled { opacity: .5; cursor: not-allowed; }
+.zoom-ctl {
+  display: flex; align-items: center; border: 1px solid var(--border);
+  border-radius: 999px; background: var(--panel-3); overflow: hidden;
+}
+.zoom-ctl button {
+  border: 0; background: transparent; color: var(--muted); cursor: pointer;
+  font-size: 12px; line-height: 1; padding: 6px 9px; transition: all .15s;
+}
+.zoom-ctl button:hover { color: #9fb6ff; background: var(--accent-soft); }
+.zoom-ctl #zoom-label { min-width: 44px; font-family: var(--mono); font-size: 11.5px; color: #9fb6ff; }
+.input-row { display: flex; gap: 9px; align-items: flex-end; }
+textarea#input {
+  flex: 1; resize: none; background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 11px; padding: 11px 13px;
+  font-size: 14px; line-height: 1.55; font-family: inherit;
+  outline: none; max-height: 200px; min-height: 72px;
+  transition: border .15s;
+}
+textarea#input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.send-btn {
+  width: 42px; height: 42px; border-radius: 10px; flex: none;
+  background: linear-gradient(135deg, #4f7dff, #3a5ce0); color: #fff; font-size: 17px;
+  display: grid; place-items: center; box-shadow: 0 3px 12px rgba(79, 125, 255, .3);
+  transition: all .15s;
+}
+.send-btn:hover { filter: brightness(1.12); }
+.send-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+/* ============================================================== 中栏：表格 */
+.sheet-toolbar {
+  flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; border-bottom: 1px solid var(--border); flex-wrap: wrap;
+}
+select#file-select {
+  background: var(--panel-3); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 5px 9px; font-size: 13px; outline: none; max-width: 240px;
+}
+select#file-select:focus { border-color: var(--accent); }
+.tabs { display: flex; gap: 5px; flex-wrap: wrap; }
+.tab {
+  padding: 4px 13px; border-radius: 8px 8px 0 0; font-size: 12.5px; color: var(--muted);
+  border: 1px solid transparent; border-bottom: none; transition: all .15s; position: relative; top: 1px;
+}
+.tab:hover { color: var(--text); }
+.tab.on { color: #9fb6ff; background: var(--panel); border-color: var(--border); }
+.grid-wrap { flex: 1; overflow: auto; padding: 12px 14px 20px; --grid-z: 1; }
+table.grid { border-collapse: separate; border-spacing: 0; font-size: calc(12.5px * var(--grid-z)); }
+table.grid th {
+  position: sticky; top: 0; z-index: 2; background: #1a2130; color: var(--muted);
+  font-weight: 600; font-size: calc(11.5px * var(--grid-z)); padding: calc(4px * var(--grid-z)) 0;
+  border: 1px solid #202839; min-width: calc(76px * var(--grid-z));
+}
+table.grid th.rowhead {
+  left: 0; z-index: 3; min-width: calc(38px * var(--grid-z)); width: calc(38px * var(--grid-z)); background: #171e2c;
+}
+table.grid th.corner { left: 0; z-index: 4; background: #1e2637; }
+table.grid td {
+  padding: calc(4px * var(--grid-z)) calc(9px * var(--grid-z)); border: 1px solid #202839; color: #c3cddf;
+  max-width: calc(180px * var(--grid-z)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: var(--panel); transition: background .3s;
+  scroll-margin: calc(46px * var(--grid-z)) calc(64px * var(--grid-z));  /* 高亮滚动到视野内时避开 sticky 表头与行号列 */
+}
+table.grid td.num { text-align: right; font-family: var(--mono); color: #8fd0a8; }
+table.grid td.formula { color: #7ec8ff; font-family: var(--mono); }
+table.grid td.empty { color: #3b4459; }
+table.grid td.has-dropdown { padding: 0; }
+.cell-dropdown {
+  width: 100%; min-width: calc(70px * var(--grid-z)); max-width: calc(178px * var(--grid-z));
+  border: 0; border-radius: 0; padding: calc(4px * var(--grid-z)); font: inherit;
+  color: #b6e4cf; background: transparent; cursor: pointer; color-scheme: dark;
+}
+.cell-dropdown:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
+.cell-dropdown:disabled { color: var(--faint); cursor: not-allowed; }
+.cell-dropdown option { background: #151e2b; color: #dce6f5; }
+.dropdown-note { color: var(--faint); font-size: 12px; padding: 6px 4px; }
+table.grid td.mark-target {
+  outline: 2px dashed var(--accent); outline-offset: -2px; background: var(--accent-soft) !important;
+}
+table.grid td.mark-written {
+  background: var(--green-soft) !important; animation: flash 1.2s ease;
+}
+table.grid tr.omitted td {
+  text-align: center; color: var(--faint); font-size: 11.5px; background: #0d1119;
+  font-style: italic;
+}
+.grid-empty { color: var(--faint); font-size: 13px; padding: 30px 4px; text-align: center; }
+#formula-tip {
+  display: none; position: fixed; z-index: 60; max-width: 440px;
+  padding: 6px 10px; border-radius: 8px; border: 1px solid #2c3a5e;
+  background: #10182b; color: #7ec8ff; font-family: var(--mono); font-size: 12.5px;
+  white-space: pre-wrap; word-break: break-all;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, .55); pointer-events: none;
+}
+
+/* ============================================================== 左栏：会话面板 */
+.side-sec { padding: 13px 15px; border-bottom: 1px solid var(--border); }
+.side-sec h4 {
+  font-size: 11px; color: var(--faint); text-transform: uppercase;
+  letter-spacing: .8px; margin-bottom: 9px; font-weight: 700;
+}
+.kv { display: flex; justify-content: space-between; gap: 10px; margin: 5px 0; font-size: 12.5px; }
+.kv .k { color: var(--muted); flex: none; }
+.kv .v { color: var(--text); text-align: right; word-break: break-all; font-family: var(--mono); font-size: 12px; }
+.stat-row { display: flex; gap: 8px; margin-top: 7px; }
+.stat {
+  flex: 1; background: var(--panel); border: 1px solid var(--border); border-radius: 9px;
+  padding: 8px 6px; text-align: center;
+}
+.stat .num { font-family: var(--mono); font-size: 16px; color: #9fb6ff; font-weight: 700; }
+.stat .cap { font-size: 10.5px; color: var(--faint); margin-top: 2px; }
+.side-note { font-size: 11.5px; color: var(--faint); line-height: 1.7; }
+.side-note b { color: var(--green); font-weight: 600; }
+
+/* 打滑与提示 */
+.toast {
+  position: fixed; left: 50%; bottom: 34px; transform: translateX(-50%) translateY(16px);
+  background: #232b3d; border: 1px solid var(--border); color: var(--text);
+  padding: 9px 19px; border-radius: 10px; font-size: 13px; opacity: 0;
+  transition: all .28s; pointer-events: none; z-index: 99; box-shadow: 0 8px 26px rgba(0,0,0,.45);
+  max-width: 70vw;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast.err { border-color: var(--red); color: #ffb3b1; }
+
+@keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.72); } }
+@keyframes blink { 50% { opacity: 0; } }
+@keyframes flash { 0% { background: rgba(63, 185, 80, .55); } 100% { background: var(--green-soft); } }
+
+@media (max-width: 1180px) {
+  .col-side { display: none; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="logo">X</span>
+    ExcelCR AI Excel 公式生成
+    <small>自然语言 → DeepSeek → 本地校验 → 确认写入</small>
+  </div>
+  <div class="chips">
+    <span class="chip" id="model-chip" title="当前模型"><span class="dot"></span><span id="model-name">…</span></span>
+    <span class="chip" id="key-chip" hidden><span class="dot warn"></span>未配置 API Key</span>
+    <div class="think-switch" title="思考档位（立即生效，无需重启）">
+      <button data-think="enabled" title="每次必开深度思考，最准也最慢">思考 1</button>
+      <button data-think="disabled" title="关闭思考，响应最快">关闭 0</button>
+      <button data-think="auto" title="按需求复杂度自动切换">自动</button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- 左栏：会话面板 -->
+  <aside class="col col-side">
+    <div class="col-head">会话面板</div>
+    <div class="side-sec">
+      <h4>当前工作区</h4>
+      <div class="kv"><span class="k">文件</span><span class="v" id="side-file">—</span></div>
+      <div class="kv"><span class="k">工作表</span><span class="v" id="side-sheet">—</span></div>
+      <div class="kv"><span class="k">规模</span><span class="v" id="side-size">—</span></div>
+      <div class="kv"><span class="k">目录</span><span class="v" id="side-workdir" style="font-size:11px">—</span></div>
+    </div>
+    <div class="side-sec">
+      <h4>本次会话用量</h4>
+      <div class="stat-row">
+        <div class="stat"><div class="num" id="u-calls">0</div><div class="cap">模型调用</div></div>
+        <div class="stat"><div class="num" id="u-tokens">0</div><div class="cap">Tokens</div></div>
+        <div class="stat"><div class="num" id="u-elapsed">0s</div><div class="cap">耗时</div></div>
+      </div>
+      <div class="side-note" style="margin-top:9px">本地校验 / 概览类请求 <b>0 Token</b>：语法、函数白名单、引用范围、循环引用、逐格试算全部在 Python 内完成。</div>
+    </div>
+    <div class="side-sec">
+      <h4>最近写入</h4>
+      <div class="side-note" id="side-write">尚未写入任何单元格。</div>
+    </div>
+  </aside>
+
+  <!-- 中栏：Excel 表格 -->
+  <section class="col col-sheet">
+    <div class="sheet-toolbar">
+      <select id="file-select"><option value="">（无文件）</option></select>
+      <div class="tabs" id="sheet-tabs"></div>
+      <span class="spacer" style="margin-left:auto"></span>
+      <button class="sample" id="open-btn" title="用本机 Excel / WPS 打开当前表格，对照查看写入结果">↗ 打开原文件</button>
+      <button class="sample" id="upload-btn" title="选择自己电脑上的 .xlsx / .xlsm 表格，上传到演示台">⇧ 提交表格</button>
+      <button class="sample" id="reload-btn" title="重新加载表格">↻ 刷新</button>
+      <div class="zoom-ctl" title="表格缩放：点按钮或按住 Ctrl 滚轮（50%–200%）">
+        <button id="zoom-out" title="缩小 10%">−</button>
+        <button id="zoom-label" title="点击恢复 100%">100%</button>
+        <button id="zoom-in" title="放大 10%">+</button>
+      </div>
+      <input type="file" id="upload-input" accept=".xlsx,.xlsm" hidden>
+    </div>
+    <div class="grid-wrap" id="grid-wrap">
+      <div class="grid-empty">加载中…</div>
+    </div>
+  </section>
+
+  <!-- 右栏：对话 -->
+  <section class="col col-chat">
+    <div class="col-head">对话 <span class="spacer"></span><span id="thinking-hint" style="font-weight:400"></span></div>
+    <div class="messages" id="messages"></div>
+    <div class="composer">
+      <div class="composer-hint">
+        支持一句话需求：<b>生成公式并写入</b> · <b>校验公式</b> · <b>解释公式</b> · <b>表结构概览</b> · <b>表格加框</b><br>
+        校验 / 概览 / 加框在本地完成（0 Token）；生成类需求先预览、确认后才写入文件
+      </div>
+      <div class="input-row">
+        <textarea id="input" rows="1" placeholder="在此处输入你的需求"></textarea>
+        <button class="send-btn" id="send-btn" title="发送">➤</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ================================================================ 工具 */
+const $ = (sel) => document.querySelector(sel);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
+const fmt = (n) => Number(n || 0).toLocaleString('en-US');
+
+const THINKING_LABELS = {
+  'enabled': '深度思考常开',
+  'disabled': '关闭思考（最快）',
+  'auto': '自动切换',
+  '': '服务端默认',
+};
+
+const state = {
+  file: null, sheet: null, sheets: [], files: [],
+  saving: false, sheetLoading: false,
+  workspace: '', thinking: '', hasKey: true, busy: false, zoom: 1,
+  usage: { calls: 0, prompt: 0, completion: 0, elapsed: 0 },
+  lastRequest: '', pendingClarify: null,
+};
+
+/* ================================================================ HTTP */
+async function getJSON(url) {
+  const res = await fetch(url);
+  const data = await res.json().catch(() => ({ ok: false, error: 'HTTP ' + res.status }));
+  if (!res.ok || data.ok === false) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+async function postJSON(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({ ok: false, error: 'HTTP ' + res.status }));
+  if (!res.ok || data.ok === false) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+async function uploadFile(file) {
+  const res = await fetch('/api/upload?name=' + encodeURIComponent(file.name), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: file,
+  });
+  const data = await res.json().catch(() => ({ ok: false, error: 'HTTP ' + res.status }));
+  if (!res.ok || data.ok === false) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+
+/* ================================================ SSE：解析 data: 分片流 */
+async function streamChat(body, onEvent) {
+  const res = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || ('HTTP ' + res.status));
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let cut;
+    while ((cut = buf.indexOf('\n\n')) >= 0) {
+      const block = buf.slice(0, cut);
+      buf = buf.slice(cut + 2);
+      for (const line of block.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        let payload;
+        try { payload = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        onEvent(payload);
+      }
+    }
+  }
+}
+
+/* ================================================================ toast */
+let toastTimer = null;
+function toast(msg, isErr = false) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (isErr ? ' err' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = 'toast'; }, 3600);
+}
+
+/* ================================================ 消息流与打字机卡片 */
+const messagesEl = $('#messages');
+
+function scrollBottom(force = false) {
+  const near = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 150;
+  if (near || force) messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function addUserMsg(text) {
+  const el = document.createElement('div');
+  el.className = 'msg user';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = text;
+  el.appendChild(bubble);
+  messagesEl.appendChild(el);
+  scrollBottom(true);
+}
+
+/* 助手卡片：阶段行 → 思考链打字机 → 输出原文 → 结果卡片 */
+function addAsstMsg() {
+  const el = document.createElement('div');
+  el.className = 'msg asst';
+  el.innerHTML = `
+    <div class="card">
+      <div class="stages"></div>
+      <div class="pane pane-think" hidden>
+        <div class="pane-head"><span class="pulse"></span><span>模型思考链（实时）</span><span class="count t-count">0 字</span><span class="caret"></span></div>
+        <pre class="pane-body t-body"></pre>
+      </div>
+      <div class="pane pane-out" hidden>
+        <div class="pane-head"><span>模型输出原文</span><span class="count b-count">0 字</span><span class="caret"></span></div>
+        <pre class="pane-body b-body"></pre>
+      </div>
+      <div class="status-line"></div>
+      <div class="result"></div>
+    </div>`;
+  messagesEl.appendChild(el);
+  scrollBottom(true);
+
+  const stagesEl = el.querySelector('.stages');
+  const thinkEl = el.querySelector('.pane-think');
+  const outEl = el.querySelector('.pane-out');
+  const tBody = el.querySelector('.t-body');
+  const bBody = el.querySelector('.b-body');
+  const statusEl = el.querySelector('.status-line');
+  const resultEl = el.querySelector('.result');
+  const t0 = performance.now();
+  let tLen = 0, bLen = 0, timerId = null;
+
+  function paint(done = false) {
+    const sec = Math.max(0, (performance.now() - t0) / 1000);
+    const parts = [];
+    if (tLen) parts.push(`思考 ${fmt(tLen)} 字`);
+    if (bLen) parts.push(`正文 ${fmt(bLen)} 字`);
+    parts.push(`已用 ${sec < 10 ? sec.toFixed(1) : sec.toFixed(0)}s`);
+    statusEl.textContent = (done ? '✓ ' : '⋯ ') + parts.join(' · ');
+  }
+
+  const api = {
+    el,
+    stage(text) {
+      const prev = stagesEl.lastElementChild;
+      if (prev) prev.classList.add('done');
+      const row = document.createElement('div');
+      row.className = 'stage';
+      row.innerHTML = '<span class="sdot"></span><span></span>';
+      row.lastElementChild.textContent = text;
+      stagesEl.appendChild(row);
+      scrollBottom();
+    },
+    delta(kind, text) {
+      if (kind === 'reasoning') {
+        if (thinkEl.hidden) thinkEl.hidden = false;
+        tLen += text.length;
+        tBody.textContent += text;
+        tBody.scrollTop = tBody.scrollHeight;
+        el.querySelector('.t-count').textContent = fmt(tLen) + ' 字';
+      } else {
+        if (outEl.hidden) outEl.hidden = false;
+        bLen += text.length;
+        bBody.textContent += text;
+        bBody.scrollTop = bBody.scrollHeight;
+        el.querySelector('.b-count').textContent = fmt(bLen) + ' 字';
+      }
+      paint();
+      scrollBottom();
+    },
+    error(msg) {
+      resultEl.insertAdjacentHTML('beforeend',
+        `<div class="result-card bad"><div class="rc-head"><span class="badge bad">出错</span></div>
+         <div class="rc-err"></div></div>`);
+      resultEl.lastElementChild.querySelector('.rc-err').textContent = msg;
+      scrollBottom();
+    },
+    finish() {
+      if (timerId) { clearInterval(timerId); timerId = null; }
+      const rows = stagesEl.querySelectorAll('.stage');
+      if (rows.length) rows[rows.length - 1].classList.add('done');
+      thinkEl.classList.add('done');
+      el.querySelectorAll('.caret').forEach((c) => c.remove());
+      el.querySelectorAll('.pulse').forEach((p) => p.remove());
+      if (tLen) thinkEl.classList.add('collapsed');  // 完成后收起，点标题可回看
+      if (tLen || bLen) paint(true); else statusEl.remove();
+    },
+    resultEl,
+  };
+
+  timerId = setInterval(() => { if (tLen || bLen) { paint(); scrollBottom(); } }, 1000);
+  return api;
+}
+
+/* ================================================ 结果卡片渲染 */
+function usageBadge(usage) {
+  if (!usage || !usage.calls) return '<span class="badge zero">本地处理 · 0 Token</span>';
+  const total = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
+  return `<span class="badge token">${usage.calls} 次调用 · ${fmt(total)} tokens · ${usage.elapsed_seconds ?? 0}s</span>`;
+}
+
+/* 单元格标记（预览虚线 / 写入变绿）归属“文件+工作表”：只在该表渲染时保留，
+   切到别的表后不会跟着地址把同位置格子点亮。 */
+let gridMarks = { file: '', sheet: '', cells: [], cls: null };
+
+const cellMarks = (cells, cls) => {
+  let first = null;
+  for (const name of cells || []) {
+    const td = document.getElementById('cell-' + name);
+    if (!td) continue;
+    td.classList.remove('mark-target', 'mark-written');
+    if (cls) {
+      td.classList.add(cls);
+      if (!first) first = td;
+    }
+  }
+  if (first) first.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  const wrap = $('#grid-wrap');
+  gridMarks = cls && cells && cells.length
+    ? { file: wrap.dataset.file || '', sheet: wrap.dataset.sheet || '', cells: [...cells], cls }
+    : { file: '', sheet: '', cells: [], cls: null };
+};
+
+/* “A14:B18” → ['A14','A15',...,'B18']：加框预览用它给整个范围打虚线标记 */
+function expandRange(ref) {
+  const m = /^([A-Za-z]{1,3})([0-9]+):([A-Za-z]{1,3})([0-9]+)$/.exec((ref || '').trim());
+  if (!m) return [];
+  const colNum = (name) => name.toUpperCase().split('').reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0);
+  const colName = (n) => { let s = ''; while (n > 0) { const rem = (n - 1) % 26; s = String.fromCharCode(65 + rem) + s; n = (n - 1 - rem) / 26; } return s; };
+  const c1 = colNum(m[1]), c2 = colNum(m[3]), r1 = parseInt(m[2], 10), r2 = parseInt(m[4], 10);
+  if (c1 > c2 || r1 > r2 || (c2 - c1 + 1) * (r2 - r1 + 1) > 2000) return [];
+  const out = [];
+  for (let r = r1; r <= r2; r++) for (let c = c1; c <= c2; c++) out.push(colName(c) + r);
+  return out;
+}
+
+function renderResult(kind, p, card) {
+  if (kind === 'generate') return renderGenerate(p, card);
+  if (kind === 'validate') return renderValidate(p, card);
+  if (kind === 'explain') return renderExplain(p, card);
+  if (kind === 'describe') return renderDescribe(p, card);
+}
+
+function renderGenerate(p, card) {
+  const el = card.resultEl;
+  const cells = p.cells || [];
+  // “把范围框起来”：只有格式、没有写入，卡片走单独的呈现分支
+  const frameOnly = cells.length === 0 && !!p.table;
+  const dropdownOnly = !!p.dropdown;
+  // 下拉/加框通常纯本地完成；下拉走模型兜底时按真实用量展示（不能用 0 Token 糊弄）
+  const localOnly = (frameOnly || dropdownOnly) && !(p.usage && p.usage.calls);
+
+  if (p.clarification) {
+    el.insertAdjacentHTML('beforeend',
+      `<div class="result-card" style="border-color:rgba(210,165,58,.45)">
+         <div class="rc-head"><span class="badge warn">需要补充信息</span>${usageBadge(p.usage)}</div>
+         <div class="rc-line"></div>
+         <div class="rc-more">下一条输入会作为补充自动拼接到原需求。</div>
+       </div>`);
+    el.lastElementChild.querySelector('.rc-line').textContent = p.clarification;
+    state.pendingClarify = state.lastRequest;
+    scrollBottom();
+    return;
+  }
+
+  if (!p.ok) {
+    const attempts = p.attempts || [];
+    const attemptHtml = attempts.length ? `
+      <details class="rc-details"><summary>生成过程：共 ${attempts.length} 轮（每轮都过了本地校验才放行）</summary>
+      <div class="det-body">${attempts.map((a) => (
+        `第 ${a.round} 轮: ${a.formula || '（无公式）'}\n  ${a.ok ? '✓ 通过' : (a.errors || []).map((e) => '✗ ' + e).join('\n  ')}`
+      )).map(esc).join('\n\n')}</div></details>` : '';
+    el.insertAdjacentHTML('beforeend',
+      `<div class="result-card bad">
+         <div class="rc-head"><span class="badge bad">未通过</span><span class="rc-title">${p.operation === 'dropdown' ? '未能设置下拉列表' : '未能生成可用公式'}</span>${usageBadge(p.usage)}</div>
+         <div class="rc-err"></div>
+         <div class="rc-more">未对文件做任何修改。</div>
+         ${attemptHtml}
+       </div>`);
+    el.lastElementChild.querySelector('.rc-err').textContent = p.error || '校验未通过';
+    scrollBottom();
+    return;
+  }
+
+  // 成功：主内容（仅加框 / 单格大公式 / 多格列表）
+  let mainHtml;
+  if (dropdownOnly) {
+    const d = p.dropdown;
+    mainHtml = `<div class="rc-formula"><span class="cellref">${esc(d.sheet)}!${esc(d.range)}</span><code>设置下拉列表（不改动现有内容）</code></div>` +
+      `<div class="rc-line">来源：${esc(d.source)}</div>` +
+      `<div class="rc-line">选项：${esc(d.options.slice(0, 20).join('、'))}${d.options.length > 20 ? ` … 共 ${d.options.length} 项` : ''}</div>` +
+      (d.warnings || []).map((w) => `<div class="rc-warn">${esc(w)}</div>`).join('');
+  } else if (frameOnly) {
+    mainHtml = `<div class="rc-formula"><span class="cellref">${esc(p.table.table_range)}</span><code>加细边框（不写入单元格内容）</code></div>`;
+  } else if (cells.length === 1) {
+    const c = cells[0];
+    const content = c.formula ? esc(c.formula) : esc(String(c.value)) + '　（常量值）';
+    mainHtml = `<div class="rc-formula"><span class="cellref">${esc(c.cell)}</span><code>${content}</code></div>`;
+  } else {
+    const shown = cells.slice(0, 40);
+    const rows = shown.map((c) => {
+      const content = c.formula ? esc(c.formula) : esc(String(c.value)) + '（值）';
+      let extra = '';
+      if (c.predicted_value != null) extra = `<td class="exp">预期 ${esc(c.predicted_value)}</td>`;
+      else if (c.predicted_note) extra = `<td class="exp">未验证</td>`;
+      else extra = '<td></td>';
+      return `<tr><td class="cell">${esc(c.cell)}</td><td>${content}</td>${extra}</tr>`;
+    }).join('');
+    mainHtml = `<div class="rc-list"><table>${rows}</table></div>` +
+      (cells.length > shown.length ? `<div class="rc-more">…还有 ${cells.length - shown.length} 个单元格</div>` : '');
+  }
+
+  const anchor = cells.find((c) => c.explanation) || cells[0] || {};
+  const lines = [];
+  if (anchor.explanation) lines.push(`<div class="rc-line"><span class="lbl">说明：</span>${esc(anchor.explanation)}</div>`);
+  if (cells.length > 1) lines.push(`<div class="rc-line"><span class="lbl">填充：</span>${esc(cells[0].cell)} → ${esc(cells[cells.length - 1].cell)}（共 ${cells.length} 个单元格）</div>`);
+  if (p.table && !frameOnly) lines.push(`<div class="rc-line"><span class="lbl">表格格式：</span>${esc(p.table.label)}</div>`);
+  if (p.predicted_value != null) lines.push(`<div class="rc-line hl">预期结果：${esc(p.predicted_value)} <span class="muted">（本地独立计算，未写入文件）</span></div>`);
+  else if (p.predicted_note) lines.push(`<div class="rc-line"><span class="lbl">预期结果：</span>未验证（${esc(p.predicted_note)}）</div>`);
+
+  const overwrites = cells.filter((c) => c.overwrites != null);
+  const warnHtml = overwrites.length
+    ? `<div class="rc-warn">⚠ 将覆盖已有内容：${overwrites.slice(0, 3).map((c) => `${esc(c.cell)}=${esc(c.overwrites)}`).join('、')}${overwrites.length > 3 ? ` … 共 ${overwrites.length} 个` : ''}</div>`
+    : '';
+  const assumptions = (p.assumptions || []).length
+    ? `<div class="rc-line"><span class="lbl">假设：</span>${esc(p.assumptions.join('；'))}</div>` : '';
+
+  const v = p.validation || {};
+  const vHtml = `<details class="rc-details"><summary>校验详情（本地 AST + 函数白名单 + 引用范围 + 逐格试算）</summary>
+    <div class="det-body">函数: ${esc((v.functions || []).join(', ') || '—')}
+引用: ${esc((v.refs || []).join(', ') || '—')}
+${esc((v.warnings || []).map((w) => '提示: ' + w).join('\n') || '无警告')}</div></details>`;
+
+  const attempts = p.attempts || [];
+  const repairHtml = attempts.length > 1
+    ? `<details class="rc-details"><summary>自动修复：共 ${attempts.length} 轮（失败错误回传模型修正）</summary>
+       <div class="det-body">${attempts.map((a) => `第 ${a.round} 轮: ${a.formula}\n  ${a.ok ? '✓ 通过' : (a.errors || []).join('\n  ')}`).map(esc).join('\n\n')}</div></details>`
+    : '';
+
+  el.insertAdjacentHTML('beforeend',
+    `<div class="result-card ok">
+       <div class="rc-head"><span class="badge ${localOnly ? 'zero' : 'ok'}">${localOnly ? '本地处理 · 0 Token' : '校验通过'}</span><span class="rc-title">${dropdownOnly ? '下拉列表预览' : frameOnly ? '表格加框预览' : '公式预览'}</span>${localOnly ? '' : usageBadge(p.usage)}</div>
+       ${mainHtml}${lines.join('')}${warnHtml}${assumptions}${localOnly || dropdownOnly ? '' : vHtml}${repairHtml}
+       <div class="rc-actions">
+         <button class="btn primary apply-btn">${dropdownOnly ? '确认设置下拉列表' : frameOnly ? '确认套用边框' : `确认写入 ${cells.length} 个单元格`}</button>
+         <button class="btn ghost cancel-btn">放弃</button>
+       </div>
+     </div>`);
+  const markCells = dropdownOnly ? (p.dropdown.range.includes(':') ? expandRange(p.dropdown.range) : [p.dropdown.range])
+    : frameOnly ? expandRange(p.table.table_range) : cells.map((c) => c.cell);
+  if (p.file_name === state.file && p.sheet === state.sheet) cellMarks(markCells, 'mark-target');
+
+  const box = el.lastElementChild;
+  const applyBtn = box.querySelector('.apply-btn');
+  applyBtn.addEventListener('click', () => doApply(p.proposal_id, card, markCells, p.file_name, p.sheet));
+  box.querySelector('.cancel-btn').addEventListener('click', () => {
+    box.querySelector('.rc-actions').remove();
+    box.insertAdjacentHTML('beforeend', '<div class="rc-more">已放弃，文件未改动。</div>');
+    cellMarks(markCells, null);
+  });
+  scrollBottom();
+}
+
+async function doApply(pid, card, cellRefs, fileName, targetSheet) {
+  if (state.saving) return;
+  const viewSheet = state.sheet;
+  const btn = card.el.querySelector('.apply-btn');
+  const label0 = btn ? btn.textContent : '确认写入';
+  if (!pid) { toast('方案令牌缺失，请重新生成', true); return; }
+  if (btn) { btn.disabled = true; btn.textContent = '写入中…'; }
+  state.saving = true;
+  try {
+    const data = await postJSON('/api/apply', { proposal_id: pid });
+    const a = data.applied || {};
+    const fidelity = a.fidelity || {};
+    const styled = a.styled || [];
+    const box = btn.closest('.result-card');
+    box.querySelector('.rc-actions')?.remove();
+    const warnHtml = (fidelity.warnings || []).map((w) => `<div class="rc-warn">⚠ ${esc(w)}</div>`).join('');
+    const styledHtml = styled.length
+      ? `<div class="rc-line"><span class="lbl">格式沿用：</span>${esc(styled.slice(0, 3).join('、'))}${styled.length > 3 ? ` 等 ${styled.length} 个` : ''}</div>` : '';
+    const tables = a.tables || [];
+    const tablesHtml = tables.length
+      ? `<div class="rc-line"><span class="lbl">表格格式：</span>${esc(tables.join('、'))}</div>` : '';
+    const backupHtml = a.backup_name
+      ? `<div class="rc-line"><span class="lbl">原文件已备份：</span>${esc(a.backup_name)}</div>` : '';
+    const wrote = a.unchanged ? '规则已存在，文件未改动' : a.dropdown ? '已设置下拉列表'
+      : a.count ? `已写入 ${a.count} 个单元格` : '已套用表格格式';
+    box.insertAdjacentHTML('beforeend',
+      `<div class="written-banner">✔ ${wrote} → ${esc(a.file_name)}</div>
+       ${backupHtml}${styledHtml}${tablesHtml}${warnHtml}
+       <div class="rc-more">日志：logs/excelcr.log</div>`);
+    if (state.file === fileName && state.sheet === viewSheet && !state.sheetLoading) {
+      await loadSheet(targetSheet, true);
+      if (state.file === fileName && state.sheet === targetSheet) cellMarks(cellRefs, 'mark-written');
+    }
+    toast(`${wrote} → ${a.file_name}`);
+    const sideWrite = $('#side-write');
+    sideWrite.innerHTML = '';
+    sideWrite.append(`✔ ${wrote} → ${a.file_name}`);
+    if (a.backup_name) { sideWrite.appendChild(document.createElement('br')); sideWrite.append(`备份：${a.backup_name}`); }
+  } catch (err) {
+    if (btn) { btn.disabled = false; btn.textContent = label0; }
+    toast(err.message, true);
+    card.error('写入失败：' + err.message);
+  } finally {
+    state.saving = false;
+  }
+}
+
+function renderValidate(p, card) {
+  const v = p.validation || {};
+  const meta = [];
+  if ((v.functions || []).length) meta.push(`使用函数：${esc(v.functions.join(', '))}`);
+  if ((v.refs || []).length) meta.push(`引用：${esc(v.refs.join(', '))}`);
+  let pred = '';
+  if (p.predicted_value != null) pred = `<div class="rc-line hl">本地独立计算结果：${esc(p.predicted_value)}</div>`;
+  else if (p.predicted_note) pred = `<div class="rc-line"><span class="lbl">本地计算：</span>未验证（${esc(p.predicted_note)}）</div>`;
+  card.resultEl.insertAdjacentHTML('beforeend',
+    `<div class="result-card ${v.ok ? 'ok' : 'bad'}">
+       <div class="rc-head"><span class="badge zero">本地处理 · 0 Token</span>
+         <span class="rc-title">${v.ok ? '校验通过 ✔' : '校验未通过 ✘'}</span></div>
+       <div class="rc-formula"><code>${esc(p.formula)}</code></div>
+       ${(v.errors || []).map((e) => `<div class="rc-err">✗ ${esc(e)}</div>`).join('')}
+       ${(v.warnings || []).map((w) => `<div class="rc-warn">⚠ ${esc(w)}</div>`).join('')}
+       ${meta.map((m) => `<div class="rc-line"><span class="lbl">${m}</span></div>`).join('')}
+       ${pred}
+     </div>`);
+  scrollBottom();
+}
+
+function renderExplain(p, card) {
+  const v = p.validation || {};
+  const note = v.ok === false ? `<div class="rc-warn">注意：${esc((v.errors || []).join('；'))}</div>` : '';
+  card.resultEl.insertAdjacentHTML('beforeend',
+    `<div class="result-card ok">
+       <div class="rc-head"><span class="badge ok">解释完成</span>${usageBadge(p.usage)}</div>
+       <div class="rc-formula"><code>${esc(p.formula)}</code></div>${note}
+     </div>`);
+  scrollBottom();
+}
+
+function renderDescribe(p, card) {
+  const rows = (p.sheets || []).map((s) => {
+    const first = (s.first_row || []).filter(Boolean).join(', ');
+    return `<div class="rc-line">· <b style="color:#c3cddf">${esc(s.sheet)}</b>：${s.rows} 行 × ${s.columns} 列${first ? `　首行：${esc(first)}` : ''}</div>`;
+  }).join('');
+  card.resultEl.insertAdjacentHTML('beforeend',
+    `<div class="result-card">
+       <div class="rc-head"><span class="badge zero">本地处理 · 0 Token</span><span class="rc-title">表结构概览</span></div>
+       ${rows}
+       <details class="rc-details"><summary>交给模型的表格内容（无损 TSV：行号 + 列字母，模型据此判断表头与数据区）</summary>
+         <div class="det-body tsv-box"></div></details>
+     </div>`);
+  card.resultEl.querySelector('.tsv-box').textContent = p.digest_text || '';
+  scrollBottom();
+}
+
+/* ================================================ 主发送流程 */
+function addUsage(u) {
+  state.usage.calls += u.calls || 0;
+  state.usage.prompt += u.prompt_tokens || 0;
+  state.usage.completion += u.completion_tokens || 0;
+  state.usage.elapsed += u.elapsed_seconds || 0;
+  $('#u-calls').textContent = fmt(state.usage.calls);
+  $('#u-tokens').textContent = fmt(state.usage.prompt + state.usage.completion);
+  const sec = state.usage.elapsed;
+  $('#u-elapsed').textContent = sec >= 10 ? Math.round(sec) + 's' : sec.toFixed(1) + 's';
+}
+
+async function send(text) {
+  text = (text || '').trim();
+  if (!text || state.busy) return;
+  if (!state.file) { toast('请先在中间栏选择 Excel 文件', true); return; }
+
+  let request = text;
+  if (state.pendingClarify) request = `${state.pendingClarify}（补充：${text}）`;
+  state.pendingClarify = null;
+  state.lastRequest = request;
+
+  addUserMsg(text);
+  const inputEl = $('#input');
+  inputEl.value = '';
+  autoGrow();
+  const card = addAsstMsg();
+  state.busy = true;
+  $('#send-btn').disabled = true;
+  cellMarks([...document.querySelectorAll('.mark-target, .mark-written')].map((td) => td.id.slice(5)), null);
+
+  try {
+    await streamChat({ request, file: state.file, sheet: state.sheet }, (ev) => {
+      if (ev.type === 'stage') card.stage(ev.text);
+      else if (ev.type === 'delta') card.delta(ev.kind, ev.text);
+      else if (ev.type === 'error') card.error(ev.message);
+      else if (ev.type === 'result') {
+        if (ev.payload && ev.payload.usage) addUsage(ev.payload.usage);
+        renderResult(ev.kind, ev.payload || {}, card);
+      }
+    });
+  } catch (err) {
+    card.error(err.message || String(err));
+  } finally {
+    card.finish();
+    state.busy = false;
+    $('#send-btn').disabled = false;
+  }
+}
+
+/* ================================================ 表格渲染 */
+const colLetter = (n) => {
+  let s = '';
+  while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); }
+  return s;
+};
+
+let sheetReq = 0;
+async function loadSheet(sheet = null, quiet = false) {
+  if (!state.file) return;
+  const reqId = ++sheetReq;
+  const file = state.file;
+  state.sheetLoading = true;
+  const q = new URLSearchParams({ file });
+  if (sheet) q.set('sheet', sheet);
+  try {
+    const data = await getJSON('/api/sheet?' + q.toString());
+    if (reqId !== sheetReq || state.file !== file) return;  // 防后发先至
+    data.grid.file = file;
+    data.grid.sheet = data.current;
+    data.grid.file_version = data.file_version;
+    state.sheets = data.sheets || [];
+    state.sheet = data.current;
+    renderTabs();
+    renderGrid(data.grid, null, quiet);
+    $('#side-file').textContent = data.file;
+    $('#side-sheet').textContent = data.current;
+    $('#side-size').textContent = `${data.grid.max_row || 0} 行 × ${data.grid.max_column || 0} 列`;
+  } catch (err) {
+    if (reqId !== sheetReq || state.file !== file) return;
+    lastGridData = null;
+    if (!quiet) toast(err.message, true);
+    $('#grid-wrap').innerHTML = '<div class="grid-empty"></div>';
+    $('#grid-wrap').firstElementChild.textContent = err.message;
+  } finally {
+    if (reqId === sheetReq) state.sheetLoading = false;
+  }
+}
+
+function renderTabs() {
+  const box = $('#sheet-tabs');
+  box.innerHTML = '';
+  for (const s of state.sheets) {
+    const b = document.createElement('button');
+    b.className = 'tab' + (s.sheet === state.sheet ? ' on' : '');
+    b.textContent = s.sheet;
+    b.title = `${s.rows} 行 × ${s.columns} 列`;
+    b.addEventListener('click', () => loadSheet(s.sheet));
+    box.appendChild(b);
+  }
+}
+
+/* 数据之外补出空白行列：像打开一张真实工作表，留出可写区域，
+   目标单元格越出数据范围时也能照常高亮、自动滚入视野。
+   渲染后还会按容器实测尺寸再补一轮，让网格铺满可视区域。 */
+const GRID_MIN_ROWS = 20;    // 一屏至少 20 行
+const GRID_EXTRA_ROWS = 8;   // 数据之下再留 8 行
+const GRID_MIN_COLS = 12;    // 至少 12 列（A-L）
+const GRID_EXTRA_COLS = 6;   // 数据右侧再留 6 列
+const GRID_MAX_ROWS = 300;   // 防大表 DOM 过重
+const GRID_MAX_COLS = 40;    // 与后端截断口径一致
+
+let lastGridData = null;     // 最近一次网格数据：窗口尺寸变化后按新视口重新铺满
+let dropdownCells = new Map();
+
+function dropdownHtml(address) {
+  const entry = dropdownCells.get(address);
+  if (!entry || entry.rule.hidden) return null;
+  const { rule, current } = entry;
+  const error = current.error || rule.error;
+  const value = current.selected == null ? '' : String(current.selected);
+  const label = current.current || '请选择…';
+  // 按需填充选项，避免数百个单元格各复制上千项拖慢网格。
+  return `<select class="cell-dropdown" data-cell="${esc(address)}" data-original="${esc(value)}" aria-label="${esc(address)} 下拉列表" title="${esc(error || current.current || '选择后确认保存')}"${error ? ' disabled' : ''}>` +
+    `<option value="${esc(value)}" selected${value === '' ? ' disabled' : ''}>${esc(label)}</option></select>`;
+}
+
+function hydrateDropdown(event) {
+  const select = event.target.closest('.cell-dropdown');
+  if (!select || select.disabled || select.dataset.loaded) return;
+  const entry = dropdownCells.get(select.dataset.cell);
+  if (!entry) return;
+  const old = select.dataset.original;
+  select.innerHTML = '';
+  if (old === '') {
+    const placeholder = new Option(entry.current.current || '请选择…', '', true, true);
+    placeholder.disabled = true;
+    select.add(placeholder);
+  }
+  entry.rule.options.forEach((item, i) => select.add(new Option(item.label, String(i), false, String(i) === old)));
+  select.value = old;
+  select.dataset.loaded = '1';
+}
+$('#grid-wrap').addEventListener('pointerdown', hydrateDropdown);
+$('#grid-wrap').addEventListener('focusin', hydrateDropdown);
+$('#grid-wrap').addEventListener('change', async (event) => {
+  const select = event.target.closest('.cell-dropdown');
+  if (!select) return;
+  const old = select.dataset.original;
+  const chosen = select.value;
+  const entry = dropdownCells.get(select.dataset.cell);
+  const grid = lastGridData;
+  if (chosen === old) return;
+  if (state.saving || state.sheetLoading || !entry || !grid || grid.file !== state.file || grid.sheet !== state.sheet) {
+    select.value = old;
+    return;
+  }
+  const label = entry.rule.options[Number(chosen)]?.label;
+  if (chosen === '' || label == null || !window.confirm(`确认修改 ${grid.file} · ${grid.sheet}!${select.dataset.cell}？\n${entry.current.current || '（空白）'} → ${label}\n确认后将备份并保存到 Excel 文件。`)) {
+    select.value = old;
+    return;
+  }
+  state.saving = true;
+  select.disabled = true;
+  try {
+    const data = await postJSON('/api/dropdown/select', {
+      file: grid.file, sheet: grid.sheet, cell: select.dataset.cell, rule_id: entry.rule.id,
+      option_index: Number(chosen), file_version: grid.file_version,
+    });
+    const a = data.applied;
+    const message = `已保存 ${grid.sheet}!${select.dataset.cell} → ${label}`;
+    $('#side-write').textContent = message + (a.backup_name ? `；备份：${a.backup_name}` : '');
+    toast(message);
+    for (const warning of a.fidelity?.warnings || []) toast(warning, true);
+    if (state.file === grid.file && state.sheet === grid.sheet && !state.sheetLoading) {
+      await loadSheet(grid.sheet, true);
+      if (state.file === grid.file && state.sheet === grid.sheet) cellMarks([select.dataset.cell], 'mark-written');
+    }
+  } catch (err) {
+    select.value = old;
+    toast('保存失败：' + err.message, true);
+  } finally {
+    state.saving = false;
+    select.disabled = false;
+  }
+});
+
+function rowHtml(rowNo, cols, values, formulas, extra) {
+  const tds = cols.map((label, i) => {
+    const v = values ? String(values[i] ?? '') : '';
+    const f = (formulas && formulas[i]) || '';
+    let cls = '';
+    if (v === '') cls = 'empty';
+    else if (v.startsWith('=')) cls = 'formula';
+    else if (/^-?\d+(\.\d+)?$/.test(v) && v.length < 13) cls = 'num';
+    const short = v.length > 24 ? v.slice(0, 23) + '…' : v;
+    const tip = f ? ` data-formula="${esc(f)}"` : '';
+    const dropdown = dropdownHtml(`${label}${rowNo}`);
+    return `<td id="cell-${label}${rowNo}" class="${dropdown ? 'has-dropdown' : cls}"${tip}>${dropdown || esc(short)}</td>`;
+  }).join('');
+  return `<tr><th class="rowhead">${rowNo}</th>${tds}${extra ? '<td class="empty">…</td>' : ''}</tr>`;
+}
+
+/* 按实测尺寸估算铺满可视区还需多少列、多少行（第二遍渲染传入）。
+   增量法 + 亚像素精度（getBoundingClientRect）：从当前表格实际大小出发，
+   用空白行高与平均列宽推算还能再补几格，确保补完不溢出、不出现滚动条 */
+function fillSizing(wrap, table, displayCols, displayRows, extra) {
+  const rect = table.getBoundingClientRect();
+  const rowhead = table.querySelector('th.rowhead');
+  const lastRow = table.rows.length ? table.rows[table.rows.length - 1] : null;
+  const rowheadW = rowhead ? rowhead.getBoundingClientRect().width : 40;
+  // 下限只做防异常兜底（8px）：缩放到 50% 时空白行仅 ~14px，钳制过大会少补
+  const blankH = Math.max(8, lastRow ? lastRow.getBoundingClientRect().height : 29);  // 最后一行必为空白行
+  const colW = Math.max(8, (rect.width - rowheadW) / (displayCols + extra));
+  const availW = wrap.clientWidth - 28;   // 左右内边距 14×2
+  const availH = wrap.clientHeight - 32;  // 上下内边距 12 + 20
+  return {
+    cols: displayCols + Math.max(0, Math.floor((availW - rect.width) / colW)),
+    rows: displayRows + Math.max(0, Math.floor((availH - rect.height) / blankH)),
+  };
+}
+
+function renderGrid(grid, fill, keepScroll) {
+  if (grid) lastGridData = grid;
+  const wrap = $('#grid-wrap');
+  const dataRows = (grid && grid.max_row) || 0;
+  const dataCols = (grid && grid.max_column) || 0;
+  const given = (grid && grid.rows) || [];
+  const lastGiven = given.length ? given[given.length - 1].row : 0;
+  const rowsTruncated = ((grid && grid.truncated_rows) || 0) > 0;
+  dropdownCells = new Map();
+  let dropdownRows = 0, dropdownCols = 0, dropdownOutside = false;
+  const givenRows = new Set(given.map((row) => row.row));
+  for (const rule of grid?.dropdowns || []) {
+    for (const [address, current] of Object.entries(rule.cells || {})) {
+      dropdownCells.set(address, { rule, current });
+      const m = /^([A-Z]+)([0-9]+)$/.exec(address);
+      const col = m[1].split('').reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0);
+      dropdownRows = Math.max(dropdownRows, Number(m[2]));
+      dropdownCols = Math.max(dropdownCols, col);
+      if (rowsTruncated && !givenRows.has(Number(m[2]))) dropdownOutside = true;
+    }
+    for (const ref of rule.ranges) {
+      const m = /([A-Z]+)([0-9]+)$/.exec(ref);
+      const col = m[1].split('').reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0);
+      if (Number(m[2]) > GRID_MAX_ROWS || col > GRID_MAX_COLS) dropdownOutside = true;
+    }
+  }
+
+  // 铺满需求（第二遍渲染传入）：只增不减，数据本身需要的行列优先
+  const wantCols = (fill && fill.cols) || 0;
+  const wantRows = (fill && fill.rows) || 0;
+  const displayCols = Math.min(Math.max(dataCols + GRID_EXTRA_COLS, GRID_MIN_COLS, wantCols, dropdownCols), GRID_MAX_COLS);
+  // 行本身已被闸门截断（超 200 行）时不再补空白行，避免画一张永远不会用的巨网格
+  const displayRows = rowsTruncated ? lastGiven : Math.min(Math.max(dataRows + GRID_EXTRA_ROWS, GRID_MIN_ROWS, wantRows, dropdownRows), GRID_MAX_ROWS);
+
+  const cols = [];
+  for (let c = 1; c <= displayCols; c++) cols.push(colLetter(c));
+  const extra = grid && grid.truncated_columns ? 1 : 0;
+  const head = '<tr><th class="corner">·</th>' + cols.map((c) => `<th>${c}</th>`).join('') +
+    (extra ? `<th title="另有 ${grid.truncated_columns} 列未列出">…</th>` : '') + '</tr>';
+
+  const body = [];
+  let prev = 0;
+  for (const row of given) {
+    if (prev && row.row > prev + 1) {
+      body.push(`<tr class="omitted"><td colspan="${cols.length + 1 + extra}">第 ${prev + 1}-${row.row - 1} 行已省略（共 ${row.row - prev - 1} 行）</td></tr>`);
+    }
+    body.push(rowHtml(row.row, cols, row.values, row.formulas, extra));
+    prev = row.row;
+  }
+  if (!rowsTruncated) {
+    for (let r = lastGiven + 1; r <= displayRows; r++) body.push(rowHtml(r, cols, null, null, extra));
+  } else if (lastGiven < dataRows) {
+    body.push(`<tr class="omitted"><td colspan="${cols.length + 1 + extra}">第 ${lastGiven + 1}-${dataRows} 行已省略（共 ${dataRows - lastGiven} 行）</td></tr>`);
+  }
+
+  const keep = keepScroll ? [wrap.scrollLeft, wrap.scrollTop] : null;
+
+  const tip = dataRows ? '' : '<div class="grid-empty">这张工作表暂无数据——可直接在下方网格中指定目标单元格。</div>';
+  const notice = [grid?.dropdown_warning, dropdownOutside ? '部分下拉单元格超出网页显示范围或位于省略行，请在 Excel 中操作。' : null].filter(Boolean);
+  wrap.innerHTML = tip + notice.map((text) => `<div class="dropdown-note">${esc(text)}</div>`).join('') + `<table class="grid">${head}${body.join('')}</table>`;
+  // 重排（铺满补足 / 窗口缩放）保留标记与滚动位置；标记只在所属表上恢复，
+  // 切表/切文件时不跟着地址跑到别的表上
+  wrap.dataset.file = (grid && grid.file) || '';
+  wrap.dataset.sheet = (grid && grid.sheet) || '';
+  if (gridMarks.cls && wrap.dataset.sheet
+      && gridMarks.file === wrap.dataset.file && gridMarks.sheet === wrap.dataset.sheet) {
+    for (const name of gridMarks.cells) {
+      const td = document.getElementById('cell-' + name);
+      if (td) td.classList.add(gridMarks.cls);
+    }
+  }
+  if (keep) { wrap.scrollLeft = keep[0]; wrap.scrollTop = keep[1]; }
+
+  // 第一遍渲染后测量：没铺满就带上目标行列数再渲染一遍（只补一轮，不迭代）
+  if (!fill) {
+    const table = wrap.querySelector('table.grid');
+    const need = table && fillSizing(wrap, table, displayCols, displayRows, extra);
+    if (need && (need.cols > displayCols || need.rows > displayRows)) renderGrid(grid, need, keepScroll);
+  }
+}
+
+/* 窗口尺寸变化：按新视口重新铺满（防抖，保留标记与滚动位置） */
+let refitTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(refitTimer);
+  refitTimer = setTimeout(() => {
+    if (lastGridData) renderGrid(lastGridData, null, true);
+  }, 180);
+});
+
+/* ================================================ 网格缩放（50%–200%，步进 10%）
+   只改 --grid-z 一个 CSS 变量（列宽/行高/字号按比例缩放），
+   随后按新格子尺寸重新铺满，保持“数据之外全是空白格子”。 */
+const ZOOM_KEY = 'excelcr-grid-zoom';
+const ZOOM_MIN = 0.5, ZOOM_MAX = 2, ZOOM_STEP = 0.1;
+
+function zoomValue() {
+  const z = parseFloat(state.zoom);
+  return Number.isFinite(z) ? z : 1;
+}
+
+function applyZoom(z, persist = true) {
+  const v = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(z * 10) / 10));
+  state.zoom = v;
+  $('#grid-wrap').style.setProperty('--grid-z', v);
+  $('#zoom-label').textContent = Math.round(v * 100) + '%';
+  if (persist) { try { localStorage.setItem(ZOOM_KEY, String(v)); } catch (err) { /* 隐私模式忽略 */ } }
+  if (lastGridData) renderGrid(lastGridData, null, true);
+}
+
+let zoomWheelAcc = 0, zoomWheelTimer = null;
+$('#grid-wrap').addEventListener('wheel', (e) => {
+  if (!e.ctrlKey) return;                 // 仅 Ctrl+滚轮缩放，普通滚动不受影响
+  e.preventDefault();                      // 阻止浏览器整页缩放
+  zoomWheelAcc += e.deltaY;
+  clearTimeout(zoomWheelTimer);
+  zoomWheelTimer = setTimeout(() => {      // 一次滚动手势只走一档，避免连环跳档
+    applyZoom(zoomValue() + (zoomWheelAcc < 0 ? ZOOM_STEP : -ZOOM_STEP));
+    zoomWheelAcc = 0;
+  }, 90);
+}, { passive: false });
+
+/* ================================================ 顶栏 / 初始化 */
+function paintThinking(value) {
+  state.thinking = value;
+  document.querySelectorAll('.think-switch button').forEach((b) => {
+    b.classList.toggle('on', b.dataset.think === value);
+  });
+  $('#thinking-hint').textContent = THINKING_LABELS[value] ?? value;
+}
+
+function welcome() {
+  const el = document.createElement('div');
+  el.className = 'msg asst';
+  el.innerHTML = `<div class="card">
+    <div class="rc-head"><span class="rc-title">欢迎使用 AI Excel 公式生成平台</span></div>
+    <div class="rc-line">说一句中文需求，程序按固定流水线执行：<b style="color:#9fb6ff">读表结构 → DeepSeek 生成 → 本地严格校验 → 预览 → 你确认后才写入</b></div>
+    <div class="rc-line"><span class="lbl">生成/解释时会看到模型思考链实时输出；校验与概览类请求完全本地完成，0 Token。</span></div>
+    <div class="rc-line"><span class="lbl">先在中间栏选好文件与工作表，然后在下方直接输入需求。</span></div>
+    <div class="rc-line"><span class="lbl">下拉列表（0 Token）：把 B3 设置为下拉列表，选项为：华东、华南。也支持“选项来自销售订单!A2:A25”；保存后可在网页单元格内选择。</span></div>
+  </div>`;
+  messagesEl.appendChild(el);
+}
+
+function fillFileSelect(selectedName = null) {
+  const sel = $('#file-select');
+  sel.innerHTML = '';
+  for (const f of state.files) {
+    const o = document.createElement('option');
+    o.value = f; o.textContent = f;
+    sel.appendChild(o);
+  }
+  state.file = selectedName || state.files[0] || null;
+  sel.value = state.file || '';
+}
+
+async function boot() {
+  welcome();
+  try {
+    const data = await getJSON('/api/bootstrap');
+    state.files = data.files || [];
+    state.workspace = data.workspace || '';
+    state.hasKey = !!data.has_key;
+    $('#model-name').textContent = data.model || '—';
+    $('#key-chip').hidden = state.hasKey;
+    $('#side-workdir').textContent = state.workspace;
+    paintThinking(data.thinking || '');
+    let savedZoom = 1;
+    try { savedZoom = parseFloat(localStorage.getItem(ZOOM_KEY)) || 1; } catch (err) { /* 隐私模式忽略 */ }
+    applyZoom(savedZoom, false);   // 恢复上次缩放档位（网格尚无数据，不触发重铺）
+
+    if (!state.files.length) {
+      const sel = $('#file-select');
+      sel.innerHTML = '';
+      const o = document.createElement('option');
+      o.value = ''; o.textContent = '（当前目录没有 .xlsx/.xlsm）';
+      sel.appendChild(o);
+      $('#grid-wrap').innerHTML = '<div class="grid-empty">当前目录没有可用的 Excel 文件。</div>';
+      return;
+    }
+    fillFileSelect();
+    await loadSheet();
+  } catch (err) {
+    toast('初始化失败：' + err.message, true);
+  }
+}
+
+/* ================================================ 事件绑定 */
+const inputEl = $('#input');
+function autoGrow() {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
+}
+
+inputEl.addEventListener('input', autoGrow);
+inputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    send(inputEl.value);
+  }
+});
+$('#send-btn').addEventListener('click', () => send(inputEl.value));
+$('#file-select').addEventListener('change', async (e) => {
+  state.file = e.target.value || null;
+  state.sheet = null;
+  if (state.file) await loadSheet();
+});
+$('#reload-btn').addEventListener('click', async () => {
+  if (!state.file) return;
+  await loadSheet(state.sheet, true);
+  toast('表格已刷新');
+});
+$('#zoom-out').addEventListener('click', () => applyZoom(zoomValue() - ZOOM_STEP));
+$('#zoom-in').addEventListener('click', () => applyZoom(zoomValue() + ZOOM_STEP));
+$('#zoom-label').addEventListener('click', () => applyZoom(1));
+$('#open-btn').addEventListener('click', async () => {
+  if (!state.file) { toast('请先选择 Excel 文件', true); return; }
+  try {
+    await postJSON('/api/open', { file: state.file });
+    toast('已用系统默认程序打开：' + state.file);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+const uploadInput = $('#upload-input');
+$('#upload-btn').addEventListener('click', () => uploadInput.click());
+uploadInput.addEventListener('change', async () => {
+  const file = uploadInput.files && uploadInput.files[0];
+  uploadInput.value = '';  // 复原即可连续选择同一个文件
+  if (!file) return;
+  const btn = $('#upload-btn');
+  btn.disabled = true;
+  try {
+    const data = await uploadFile(file);
+    state.files = data.files || [];
+    state.sheet = null;
+    fillFileSelect(data.file);  // 上传的表格自动成为当前选中
+    await loadSheet();
+    toast(data.renamed
+      ? `已添加：${data.file}（"${file.name}" 已存在，自动改名）`
+      : `已添加：${data.file}`);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* 悬停公式格：浮出原始公式（跟随单元格定位，移开即隐藏） */
+const formulaTip = document.createElement('div');
+formulaTip.id = 'formula-tip';
+document.body.appendChild(formulaTip);
+const gridWrap = $('#grid-wrap');
+gridWrap.addEventListener('mouseover', (e) => {
+  const td = e.target.closest('td[data-formula]');
+  if (!td) {
+    formulaTip.style.display = 'none';
+    return;
+  }
+  formulaTip.textContent = td.dataset.formula;
+  formulaTip.style.display = 'block';
+  const box = td.getBoundingClientRect();
+  const tip = formulaTip.getBoundingClientRect();
+  let top = box.bottom + 6;
+  if (top + tip.height > window.innerHeight - 8) top = box.top - tip.height - 6;
+  formulaTip.style.top = Math.max(8, top) + 'px';
+  formulaTip.style.left = Math.max(8, Math.min(box.left, window.innerWidth - tip.width - 10)) + 'px';
+});
+gridWrap.addEventListener('mouseleave', () => {
+  formulaTip.style.display = 'none';
+});
+
+document.querySelectorAll('.think-switch button').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    try {
+      const data = await postJSON('/api/think', { value: btn.dataset.think });
+      paintThinking(data.thinking);
+      toast('思考档位已切换：' + data.label + '（立即生效）');
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+});
+document.addEventListener('click', (e) => {
+  const head = e.target.closest('.pane-head');
+  if (head) head.parentElement.classList.toggle('collapsed');
+});
+
+boot();
+</script>
+</body>
+</html>

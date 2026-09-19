@@ -4,8 +4,9 @@
 → 预览确认 → openpyxl 写入 → 打印结果与 Token 用量。
 
 用法：
-    python main.py                      # 进入交互模式
-    python main.py "给每科算总分写到G2"   # 单条指令模式
+    python main.py                      # 进入交互模式（同时自动打开 Web 演示台）
+    python main.py --no-web             # 只要 CLI，不启动演示台
+    python main.py "给每科算总分写到G2"   # 单条指令模式（默认不起演示台，--web 可显式打开）
 """
 from __future__ import annotations
 
@@ -14,12 +15,14 @@ import sys
 import time
 from pathlib import Path
 
-from excel_formula.config import ConfigError, SecurityError, Settings, normalize_thinking
+from excel_formula.config import ALLOWED_SUFFIXES, ConfigError, SecurityError, Settings, normalize_thinking
 from excel_formula.evaluator import UnsupportedFormula
 from excel_formula.formula_parser import FormulaSyntaxError
 from excel_formula.intent import (
     INTENT_DESCRIBE,
+    INTENT_DROPDOWN,
     INTENT_EXPLAIN,
+    INTENT_FORMAT,
     INTENT_GENERATE,
     INTENT_VALIDATE,
     classify,
@@ -39,16 +42,22 @@ BANNER = """
     · 这个表有哪些列？
     · =SUMIF(B2:B6,">85") 这个公式对不对？
     · 解释一下 G2 里的公式
-  指令：:file <路径>  :sheet <表名>  :think <1|0|auto>  :info  :help  :quit
+    · 将 A14 到 B18 的表格范围框起来
+    · 把 B3 设置为下拉列表，选项为：华东、华南
+  输入文件编号即可选择 Excel；:files 刷新列表，:file <编号或路径> 切换文件
+  指令：:sheet <表名>  :think <1|0|auto>  :info  :web  :help  :quit
 ============================================================
 """
 
 HELP = """
 可用指令：
-  :file <路径>   切换当前 Excel 文件（仅允许工作目录内的 .xlsx/.xlsm）
+  数字编号       选择文件列表中对应的 .xlsx/.xlsm（只选择，不写入）
+  :files         刷新并显示当前目录的 Excel 文件编号
+  :file <编号或路径>  切换当前 Excel 文件（受目录白名单限制）
   :sheet <表名>  指定工作表（默认取第一张有数据的表）
   :think <档位>  思考模式：1 深度思考常开 / 0 关闭（最快）/ auto 自动；不带参数看当前
   :info          查看当前文件结构（不消耗 Token）
+  :web           启动（或查看）Web 演示台地址，与 CLI 共享同一份配置
   :help          显示帮助
   :quit / :exit  退出
 其他输入按自然语言处理；写文件前一定会先预览并请你确认。
@@ -153,31 +162,107 @@ class Console:
         self.settings = Settings.from_env(workspace=Path.cwd())
         self.logger = get_logger(self.settings.log_dir)
         self.service = FormulaService(self.settings, self.logger)
+        self._file_choices: list[Path] = []
         self.current_file: Path | None = self._guess_file()
         self.current_sheet: str | None = None
+        self._web_server = None
+        self._web_url: str | None = None
+
+    # -------------------------------------------------------------- 演示台
+    def open_web(self) -> str | None:
+        """后台启动 Web 演示台并打开浏览器；已启动时只提示地址。
+
+        演示台与 CLI 共享同一个 service 与 settings：网页里切换的思考档位
+        对 CLI 立即生效，反之亦然——两个界面，一套内核。
+        """
+        if self._web_url:
+            print(f"√ Web 演示台已在运行：{self._web_url}")
+            return self._web_url
+        from webapp import start_in_background  # 延迟导入：不用演示台时不加载 http 服务
+
+        server, url = start_in_background(self.service)
+        if server is None:
+            print("× 端口 8765-8774 都被占用，无法启动 Web 演示台。")
+            return None
+        self._web_server = server
+        self._web_url = url
+        print(f"√ Web 演示台已启动：{url}")
+        print("  与 CLI 共享同一份配置：网页里切换思考档位，CLI 这边立即生效\n")
+        return url
 
     # -------------------------------------------------------------- 启动辅助
+    def _available_files(self) -> list[Path]:
+        """只列工作目录直属文件，跳过临时锁文件、子目录和越过白名单的链接。"""
+        directory = self.settings.allowed_roots[0]
+        candidates: list[Path] = []
+        try:
+            paths = sorted(directory.iterdir(), key=lambda p: (p.name.casefold(), p.name))
+        except OSError as exc:
+            print(f"× 无法列出目录：{exc}")
+            return candidates
+        for path in paths:
+            if path.name.startswith("~$") or path.suffix.lower() not in ALLOWED_SUFFIXES:
+                continue
+            try:
+                self.settings.resolve_path(path)
+            except (SecurityError, OSError):
+                continue
+            candidates.append(path)
+        return candidates
+
     def _guess_file(self) -> Path | None:
-        """工作目录里只有一个 Excel 时自动选中，省去用户输入路径。"""
-        candidates = [
-            p for p in sorted(Path.cwd().glob("*.xls[xm]"))
-            if not p.name.startswith("~$") and "backups" not in p.parts
-        ]
-        return candidates[0] if len(candidates) >= 1 else None
+        """只有一个合法 Excel 时自动选中，多文件时等待用户选择。"""
+        candidates = self._available_files()
+        return candidates[0] if len(candidates) == 1 else None
+
+    def show_files(self) -> None:
+        """保存本次展示的编号快照，文件增删不应让旧编号悄悄指向别的文件。"""
+        self._file_choices = self._available_files()
+        print(f"\n当前目录：{self.settings.allowed_roots[0]}")
+        for index, path in enumerate(self._file_choices, start=1):
+            marker = "（当前）" if path == self.current_file else ""
+            print(f"  {index}. {path.name}{marker}")
+        if not self._file_choices:
+            print("未找到 .xlsx/.xlsm 文件，可用 :file <路径> 指定文件。")
+        else:
+            print("输入编号选择文件，或用 :file <路径>；:files 可刷新列表。\n")
 
     def _need_file(self) -> Path | None:
         if self.current_file and self.current_file.is_file():
             return self.current_file
-        answer = input("要操作哪个 Excel 文件？（输入路径）> ").strip().strip('"')
-        if not answer:
-            return None
-        return self._set_file(answer)
+        self.show_files()
+        while True:
+            try:
+                answer = input("要操作哪个 Excel 文件？（编号/路径，回车取消）> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if not answer:
+                return None
+            path = self._set_file(answer)
+            if path:
+                return path
 
     def _set_file(self, raw: str) -> Path | None:
-        if not raw.strip():
-            # 空参数会解析到工作目录本身，报出“收到：ExcelCR”这种误导信息，直接给用法
-            print("? 用法：:file <文件名>，例如 :file 销售数据.xlsx")
+        raw = raw.strip().strip('"')
+        if not raw:
+            self.show_files()
             return None
+        if re.fullmatch(r"[+-]?[0-9]+", raw):
+            if not self._file_choices:
+                self.show_files()
+            if len(raw) > 10 or not 1 <= int(raw) <= len(self._file_choices):
+                print("× 文件编号无效，请输入列表中的编号（从 1 开始），或用 :files 刷新。")
+                return None
+            selected = self._file_choices[int(raw) - 1]
+            try:
+                path = self.settings.resolve_path(selected)
+            except (SecurityError, OSError) as exc:
+                print(f"× 文件不可用：{exc}。请用 :files 刷新列表。")
+                return None
+            self.current_file = path
+            self.current_sheet = None
+            print(f"√ 当前文件：{path.name}")
+            return path
         path, first_error = None, None
         for candidate in file_candidates(raw):
             try:
@@ -194,18 +279,23 @@ class Console:
         return path
 
     # -------------------------------------------------------------- 主循环
-    def run(self, once: str | None = None) -> int:
+    def run(self, once: str | None = None, open_web_demo: bool = False) -> int:
         if not once:
             print(BANNER)
             current = _THINKING_LABELS.get(self.settings.thinking, self.settings.thinking)
             print(f"思考模式：{current}（:think 1/0/auto 随时切换）")
+            self.show_files()
             if self.current_file:
-                print(f"当前文件：{self.current_file.name}（用 :file 可切换）\n")
+                print(f"当前文件：{self.current_file.name}（输入编号可切换）\n")
+            if open_web_demo:
+                self.open_web()
             if not self.settings.api_key:
                 print("提示：尚未配置 DEEPSEEK_API_KEY，生成/解释类功能不可用；")
                 print("      复制 .env.example 为 .env 并填入密钥即可。\n")
 
         if once:
+            if open_web_demo:
+                self.open_web()
             return 0 if self.handle(once) else 1
 
         while True:
@@ -222,8 +312,11 @@ class Console:
             if line == ":help":
                 print(HELP)
                 continue
-            if line.startswith(":file"):
-                self._set_file(line[5:].strip().strip('"'))
+            if line == ":files":
+                self.show_files()
+                continue
+            if line == ":file" or line.startswith(":file "):
+                self._set_file(line[5:])
                 continue
             if line.startswith(":sheet"):
                 self.current_sheet = line[6:].strip() or None
@@ -235,10 +328,15 @@ class Console:
             if line == ":info":
                 self.show_info()
                 continue
+            if line == ":web":
+                self.open_web()
+                continue
             self.handle(line)
 
     # -------------------------------------------------------------- 意图分发
     def handle(self, text: str) -> bool:
+        if re.fullmatch(r"[+-]?[0-9]+", text.strip()):
+            return self._set_file(text) is not None
         intent = classify(text)
         if intent.file and not self._set_file(intent.file):
             # 指定的文件没能打开时直接停下，不能默默拿上一个（或启动时自动猜的）文件继续
@@ -246,11 +344,11 @@ class Console:
         if intent.kind == INTENT_GENERATE and _is_bare_file_reference(text, intent.file):
             print("? 还不知道要算什么，请把需求说出来，例如「在G2算每个人的总分」。")
             return True
-        sheet = intent.sheet or self.current_sheet
         path = self._need_file()
         if not path:
             print("× 没有可操作的文件。")
             return False
+        sheet = intent.sheet or self.current_sheet
 
         self.logger.info("用户指令 kind=%s text=%s", intent.kind, text[:100])
         try:
@@ -260,8 +358,14 @@ class Console:
                 self.do_validate(path, intent.formula, sheet, intent.target)
             elif intent.kind == INTENT_EXPLAIN:
                 self.do_explain(path, intent.formula, sheet, intent.cell)
+            elif intent.kind == INTENT_FORMAT:
+                self.do_frame(path, intent.table_range, sheet)
+            elif intent.kind == INTENT_DROPDOWN:
+                self.do_dropdown(path, text, sheet)
             else:
-                self.do_generate(path, intent.request, sheet, intent.target)
+                self.do_generate(
+                    path, intent.request, sheet, intent.target, new_table=intent.new_table
+                )
         except ConfigError as exc:
             print(f"× 配置错误：{exc}")
             return False
@@ -289,9 +393,14 @@ class Console:
         print("\n交给模型的表格内容：")
         print(result["digest_text"], "\n")
 
-    def do_generate(self, path: Path, request: str, sheet: str | None, target: str | None) -> None:
+    def do_generate(
+        self, path: Path, request: str, sheet: str | None, target: str | None,
+        new_table: bool = False,
+    ) -> None:
         print("… 正在读取表结构并生成公式")
-        proposal = self._propose_with_progress(path, request, sheet, target)
+        if new_table:
+            print("（识别为新建表格：写入后自动给表头铺浅蓝底、整表加边框）")
+        proposal = self._propose_with_progress(path, request, sheet, target, new_table=new_table)
 
         if proposal.clarification:
             print(f"? {proposal.clarification}")
@@ -301,7 +410,9 @@ class Console:
                 return
             merged = f"{request}（补充：{extra}）"
             new_target = target or classify(extra).target
-            proposal = self._propose_with_progress(path, merged, sheet, new_target)
+            proposal = self._propose_with_progress(
+                path, merged, sheet, new_target, new_table=new_table
+            )
             if proposal.clarification:
                 print(f"? 仍缺少信息：{proposal.clarification}")
                 return
@@ -324,12 +435,81 @@ class Console:
 
         applied = self.service.apply(proposal)
         print(f"√ 已写入 {applied['count']} 个单元格 → {Path(applied['file']).name}")
+        styled = applied.get("styled") or []
+        if styled:
+            shown = "、".join(styled[:4])
+            if len(styled) > 4:
+                shown += f" 等共 {len(styled)} 个"
+            print(f"  已为新单元格套用相邻格式：{shown}")
+        tables = applied.get("tables") or []
+        for label in tables:
+            print(f"  已套用表格格式：{label}")
+        if applied.get("backup"):
+            print(f"  原文件已备份：{Path(applied['backup']).name}")
+        fidelity = applied.get("fidelity") or {}
+        for warning in fidelity.get("warnings", []):
+            print(f"  ⚠ {warning}")
+        if fidelity.get("preserved"):
+            print("  已保留：" + "、".join(fidelity["preserved"]))
+        print("  日志：logs/excelcr.log")
+
+    def do_dropdown(self, path: Path, request: str, sheet: str | None) -> None:
+        """列表验证复用预览、追问、确认与备份，不消耗 Token。"""
+        proposal = self.service.propose_dropdown(path, request, sheet=sheet)
+        if proposal.clarification:
+            print(f"? {proposal.clarification}")
+            extra = input("你 > ").strip()
+            if not extra:
+                print("已取消，文件未改动。")
+                return
+            proposal = self.service.propose_dropdown(path, f"{request}（补充：{extra}）", sheet=sheet)
+        print("\n----- 下拉列表预览 -----")
+        print(proposal.render())
+        if not proposal.ok:
+            return
+        answer = input(
+            f"确认给 {proposal.sheet}!{proposal.dropdown.cell_range} 设置下拉列表？[y/N] "
+        ).strip().lower()
+        if answer not in {"y", "yes", "是"}:
+            print("已取消，文件未改动。")
+            return
+        applied = self.service.apply(proposal)
+        label = "规则已存在，文件未改动" if applied.get("unchanged") else "已设置下拉列表"
+        print(f"√ {label} → {Path(applied['file']).name}")
+        if applied.get("backup"):
+            print(f"  原文件已备份：{Path(applied['backup']).name}")
+        for warning in applied.get("fidelity", {}).get("warnings", []):
+            print(f"  提示：{warning}")
+
+    def do_frame(self, path: Path, cell_range: str | None, sheet: str | None) -> None:
+        """“把范围框起来”：本地套细边框（0 Token），不调用模型。"""
+        print("… 本地套用边框（0 Token，不调用模型）")
+        proposal = self.service.frame_table(path, sheet=sheet, cell_range=cell_range)
+        print("\n----- 表格加框预览 -----")
+        print(proposal.render())
+        print("--------------------")
+        if proposal.clarification:
+            print(f"? {proposal.clarification}")
+            return
+        if not proposal.ok:
+            print("× 未套用表格格式，未对文件做任何修改。")
+            return
+        answer = input(
+            f"确认给 {proposal.sheet}!{proposal.table.table_range} 加细边框 ？[y/N] "
+        ).strip().lower()
+        if answer not in {"y", "yes", "是"}:
+            print("已取消，文件未改动。")
+            return
+        applied = self.service.apply(proposal)
+        for label in applied.get("tables") or []:
+            print(f"√ 已套用表格格式：{label} → {Path(applied['file']).name}")
         if applied.get("backup"):
             print(f"  原文件已备份：{Path(applied['backup']).name}")
         print("  日志：logs/excelcr.log")
 
     def _propose_with_progress(
-        self, path: Path, request: str, sheet: str | None, target: str | None
+        self, path: Path, request: str, sheet: str | None, target: str | None,
+        new_table: bool = False,
     ) -> Proposal:
         """调用 propose 并展示流式进度；非交互终端自动退回静默等待。"""
         progress = _StreamProgress()
@@ -339,6 +519,7 @@ class Console:
                 request,
                 sheet=sheet,
                 target=target,
+                new_table=new_table,
                 on_delta=progress if progress.enabled else None,
             )
         finally:
@@ -396,14 +577,29 @@ class Console:
             )
 
 
+def _parse_cli_args(argv: list[str]) -> tuple[str | None, bool]:
+    """解析启动参数：返回（单条指令, 是否打开 Web 演示台）。
+
+    交互模式默认自动打开演示台（--no-web 关闭）；单条指令模式默认安静
+    （--web / -w 显式打开），避免脚本化调用意外弹浏览器。
+    """
+    flags = {"--web", "-w", "--no-web"}
+    once = " ".join(a for a in argv if a not in flags).strip() or None
+    if "--no-web" in argv:
+        return once, False
+    if any(a in {"--web", "-w"} for a in argv):
+        return once, True
+    return once, once is None
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
         except (AttributeError, ValueError):
             pass
-    once = " ".join(sys.argv[1:]).strip() or None
-    return Console().run(once)
+    once, open_web_demo = _parse_cli_args(sys.argv[1:])
+    return Console().run(once, open_web_demo)
 
 
 if __name__ == "__main__":

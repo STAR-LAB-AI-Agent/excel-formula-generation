@@ -6,12 +6,20 @@
 """
 from __future__ import annotations
 
+import datetime as _dt
 from pathlib import Path
 
 import pytest
 
-from excel_formula.evaluator import ExcelError, UnsupportedFormula, evaluate_formula, format_value
+from excel_formula.evaluator import (
+    DateValue,
+    ExcelError,
+    UnsupportedFormula,
+    evaluate_formula,
+    format_value,
+)
 from excel_formula.excel_reader import WorkbookView
+from excel_formula.external import ExternalBookLoader
 from excel_formula.formula_parser import FormulaSyntaxError, parse_formula
 
 HOMEWORK = Path(__file__).resolve().parents[1] / "Excel大作业.xlsm"
@@ -31,12 +39,30 @@ def _iter_formulas(view: WorkbookView):
                     yield name, cell.coordinate, cell.value
 
 
+def _as_number(value):
+    """把一端结果折算成数值用于对账：日期类（本地 DateValue / Excel 缓存 datetime）→ 序列号。"""
+    if isinstance(value, DateValue):
+        value = value.raw
+    if isinstance(value, _dt.datetime):
+        return (value - _dt.datetime(1899, 12, 30)).total_seconds() / 86400
+    if isinstance(value, _dt.date):
+        return float((value - _dt.date(1899, 12, 30)).days)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
 def _same(computed, cached) -> bool:
-    """求值结果与 Excel 缓存值是否一致（数值给 1e-6 容差，文本精确比对）。"""
+    """求值结果与 Excel 缓存值是否一致（数值给 1e-6 容差，文本精确比对）。
+
+    日期在 Excel 里就是序列号：本地 DateValue 与缓存 datetime 先折算成序列号
+    再按数值容差比对，避免同一时刻因表示形式不同被误判为不一致。
+    """
     if isinstance(computed, bool) and isinstance(cached, bool):
         return computed is cached
-    if isinstance(computed, (int, float)) and not isinstance(computed, bool) and isinstance(cached, (int, float)):
-        return abs(float(computed) - float(cached)) < 1e-6
+    local, reference = _as_number(computed), _as_number(cached)
+    if local is not None and reference is not None:
+        return abs(local - reference) < 1e-6
     return format_value(computed) == str(cached)
 
 
@@ -63,20 +89,30 @@ def test_homework_formulas_match_excel_cached_values():
     checked = 0
     unsupported: list[str] = []
     mismatches: list[str] = []
-    for sheet, coord, formula in entries:
-        try:
-            computed = evaluate_formula(parse_formula(formula), sheets, sheet)
-        except (UnsupportedFormula, FormulaSyntaxError):
-            unsupported.append(f"{sheet}!{coord} {formula}")
-            continue
-        if isinstance(computed, ExcelError):
-            continue  # 错误值与缓存错误文本的比对不在冒烟测试范围内
-        checked += 1
-        cached = cached_values[(sheet, coord)]
-        if not _same(computed, cached):
-            mismatches.append(
-                f"{sheet}!{coord} {formula} -> 本地 {format_value(computed)!r} / Excel {cached!r}"
-            )
+    loader = ExternalBookLoader()
+    try:
+        for sheet, coord, formula in entries:
+            try:
+                computed = evaluate_formula(
+                    parse_formula(formula),
+                    sheets,
+                    sheet,
+                    load_external=loader,
+                    book_path=HOMEWORK,
+                )
+            except (UnsupportedFormula, FormulaSyntaxError):
+                unsupported.append(f"{sheet}!{coord} {formula}")
+                continue
+            if isinstance(computed, ExcelError):
+                continue  # 错误值与缓存错误文本的比对不在冒烟测试范围内
+            checked += 1
+            cached = cached_values[(sheet, coord)]
+            if not _same(computed, cached):
+                mismatches.append(
+                    f"{sheet}!{coord} {formula} -> 本地 {format_value(computed)!r} / Excel {cached!r}"
+                )
+    finally:
+        loader.close()
 
     assert checked >= 5, (
         f"参与对账的公式只有 {checked} 个，冒烟测试失去意义。"

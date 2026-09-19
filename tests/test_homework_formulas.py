@@ -2,7 +2,7 @@
 
 数据形态复刻 `Excel大作业.xlsm`（销售订单表 + 跨表查询区，含日期列与中文表名），
 覆盖嵌套 IF 评级、统计区六件套、跨表 SUMIFS、IFERROR+VLOOKUP、单元格引用、
-日期列防护与区域数组语义防护。期望值都按夹具里那 8 条订单手工核算过。
+日期序列号语义与区域数组语义。期望值都按夹具里那 8 条订单手工核算过。
 """
 from __future__ import annotations
 
@@ -160,13 +160,25 @@ def test_defined_name_marks_unverified_in_evaluator(sales_xlsx):
         _eval(sales_xlsx, "原始数据表", "=SUM(saledata)")
 
 
-def test_aggregating_over_date_column_is_unverified(sales_xlsx):
-    """日期列聚合：Excel 会把日期当序列号求和，本地给不出该语义，标"未验证"。"""
-    with pytest.raises(UnsupportedFormula, match="日期"):
-        _eval(sales_xlsx, "原始数据表", "=SUM(B2:B9)")
+def test_date_column_aggregates_use_serial_numbers(sales_xlsx):
+    """日期列聚合：按 Excel 序列号语义求和（8 个日期的序列号合计 365375）。"""
+    assert _fmt(sales_xlsx, "原始数据表", "=SUM(B2:B9)") == "365375"
 
 
-def test_array_style_condition_is_unverified(sales_xlsx):
-    """(D2:D9="华北")*J2:J9 属于数组公式语义，宁可"未验证"也不能只比首元素。"""
-    with pytest.raises(UnsupportedFormula, match="数组"):
-        _eval(sales_xlsx, "原始数据表", '=SUM((D2:D9="华北")*J2:J9)')
+def test_date_difference_is_day_count(sales_xlsx):
+    """日期相减给出天数差（2025-01-05 → 2025-02-01 共 27 天）。"""
+    assert _fmt(sales_xlsx, "原始数据表", "=B9-B2") == "27"
+
+
+def test_array_style_condition_broadcasts_elementwise(sales_xlsx):
+    """(D2:D9="华北")*J2:J9 按数组语义逐元素展开：华北两条订单 27500+24000。
+
+    旧实现把区域塌缩成首元素再比较，会给出静默算错的结果（只比较 D2），
+    曾因此整体拒绝该类写法；现在按广播规则正确展开，与 Excel 结果一致。
+    """
+    assert _fmt(sales_xlsx, "原始数据表", '=SUM((D2:D9="华北")*J2:J9)') == "51500"
+
+
+def test_array_condition_with_date_column(sales_xlsx):
+    """>=DATE(...) 的条件数组：日期元素按序列号参与比较，1/15 起四条订单合计 40000。"""
+    assert _fmt(sales_xlsx, "原始数据表", "=SUM((B2:B9>=DATE(2025,1,15))*J2:J9)") == "40000"

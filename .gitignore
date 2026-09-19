@@ -16,4 +16,17 @@ venv/
 # 运行产物
 logs/
 backups/
-~$*.xlsx
+~$*
+
+# 课程交付物与个人材料（不入库）
+开源成果申报书-*.docx
+实验报告.docx
+答辩PPT.pptx
+智能体开发实战_课程实验任务书_*.pdf
+
+# 草稿与验证产物（不入库）
+新建 XLSX 工作表.xlsx
+VLOOKUP_1.xlsx
+9_5 *.xlsx
+9_10 *.xlsx
+web/_verify_*.png

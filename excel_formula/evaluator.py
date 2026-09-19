@@ -5,22 +5,29 @@
 """
 from __future__ import annotations
 
+import calendar
 import datetime as _dt
 import math
 import re
 import statistics
 from dataclasses import dataclass
+from pathlib import Path
 
+from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
+from .excel_reader import cell_formula_text
 from .formula_parser import (
     ArrayLiteral,
     Binary,
     Bool,
     DefinedName,
     ErrorLiteral,
+    FormulaSyntaxError,
     FuncCall,
+    is_external_sheet,
     Number,
+    parse_formula,
     Ref,
     Text,
     Unary,
@@ -41,12 +48,11 @@ class ExcelError:
 
 @dataclass(frozen=True)
 class DateValue:
-    """只读视图中的日期占位值。
+    """日期/时间值的只读包装。
 
-    日期在 Excel 里本质是序列号，但本地求值器不实现日期运算。为了不让一整列日期
-    把 VLOOKUP/SUMIFS 这类「按行取值、不碰日期列」的公式拖成"未验证"，取值阶段
-    只包装不报错；一旦日期真的参与算术、文本或条件判断，就在对应算子里抛
-    UnsupportedFormula，宁可标"未验证"也不给出静默算错的结果。
+    日期在 Excel 里本质是序列号（1900 日期系统，1899-12-30 为 0）。求值全程按
+    序列号参与算术、比较与汇总；与单元格数字格式相关的行为（显示格式）无法本地
+    还原，日期与无法解析的文本比较时仍抛 UnsupportedFormula 标"未验证"。
     """
 
     raw: object
@@ -55,13 +61,53 @@ class DateValue:
         return format_value(self)
 
 
-DATE_HINT = "区域中包含日期值，本地验证暂不支持日期运算"
+_EXCEL_EPOCH = _dt.datetime(1899, 12, 30)  # 1900 日期系统的序列号 0
+DATE_HINT = "日期与无法解析的文本无法比较"
 
-# 区域直接参与 +-*/ 或比较属于数组公式语义，本地只做标量求值
-_ARRAY_IN_BINARY_HINT = (
-    "区域与值直接运算属于数组公式语义（本地不支持），"
-    "请改用 SUMIF/COUNTIFS/SUMPRODUCT 等聚合函数"
+# 文本形式的日期：DATEVALUE、日期条件（如 ">2025/1/5"）等场景按这些格式解析
+_DATE_TEXT_FORMATS = (
+    "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y年%m月%d日",
+    "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M",
 )
+
+
+def _to_serial(value) -> float:
+    """日期/时间对象 → Excel 序列号：datetime 带时间小数，date 为整数天，time 为日内小数。"""
+    if isinstance(value, _dt.datetime):
+        return (value - _EXCEL_EPOCH).total_seconds() / 86400
+    if isinstance(value, _dt.date):
+        return float((value - _EXCEL_EPOCH.date()).days)
+    return (value.hour * 3600 + value.minute * 60 + value.second) / 86400
+
+
+def _from_serial(serial: float) -> DateValue:
+    """序列号 → 日期/时间值：整数返回 date，含小数返回 datetime。"""
+    days = math.floor(serial)
+    fraction = serial - days
+    base = _EXCEL_EPOCH.date() + _dt.timedelta(days=days)
+    if fraction < 1e-9:
+        return DateValue(base)
+    clock = _dt.timedelta(seconds=round(fraction * 86400))
+    return DateValue(_dt.datetime.combine(base, _dt.time()) + clock)
+
+
+def _as_date(value) -> _dt.date:
+    """把 date/datetime 统一成 date。"""
+    return value.date() if isinstance(value, _dt.datetime) else value
+
+
+def _parse_date_text(text: str):
+    """按常见格式解析日期文本，失败返回 None。"""
+    raw = text.strip()
+    for fmt in _DATE_TEXT_FORMATS:
+        try:
+            return _dt.datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+# 跨工作簿递归求值的最大嵌套深度：防御异常的超长引用链
+_MAX_EXTERNAL_DEPTH = 24
 
 DIV0 = ExcelError("#DIV/0!")
 VALUE_ERR = ExcelError("#VALUE!")
@@ -72,9 +118,37 @@ NUM_ERR = ExcelError("#NUM!")
 class Evaluator:
     """按 AST 求值。所有取值来自 data_only 工作簿的缓存值。"""
 
-    def __init__(self, sheets: dict[str, Worksheet], default_sheet: str):
+    def __init__(
+        self,
+        sheets: dict[str, Worksheet],
+        default_sheet: str,
+        load_external=None,
+        book_path: str | Path | None = None,
+        current_cell: tuple[int, int] | None = None,
+        _stack: set | None = None,
+        _book=None,
+        _formulas: dict[str, Worksheet] | None = None,
+        _expand_uncached: bool = False,
+        _cache: dict | None = None,
+    ):
         self.sheets = sheets
         self.default_sheet = default_sheet
+        # 跨工作簿支持：load_external(sheet_name, parent_dir) → (外部工作簿, 表名) | (None, 原因)
+        self.load_external = load_external
+        self.book_path = Path(book_path) if book_path else None
+        # ROW()/COLUMN() 无参形式所需的公式所在单元格 (行, 列)。递归求值链里，
+        # 被引用的公式用自己所在的位置；调用方给不出位置时为 None，这两个函数
+        # 按"未验证"处理，而不是猜一个行号。
+        self.current_cell = current_cell
+        # 递归求值外部公式时的循环检测：整条求值链共享同一个集合
+        self._stack: set = set() if _stack is None else _stack
+        # 当前上下文来自外部工作簿时：_book 为其句柄，_formulas 为其公式视图（用于继续递归）
+        self._book = _book
+        self._formulas = _formulas
+        # 主簿里没有缓存的公式是否递归求值（展示场景开启；校验场景保持"未验证"）
+        self._expand_uncached = _expand_uncached
+        # 主簿递归求值的结果缓存：同一次顶层计算里同一格只算一次
+        self._cache: dict = {} if _cache is None else _cache
 
     # -------------------------------------------------------------- 对外入口
     def evaluate(self, node: object):
@@ -110,71 +184,157 @@ class Evaluator:
 
     def _eval_ref(self, ref: Ref):
         sheet_name = ref.sheet or self.default_sheet
-        ws = self.sheets.get(sheet_name)
+        ws = _lookup_sheet(self.sheets, sheet_name)
         if ws is None:
+            if is_external_sheet(sheet_name):
+                return self._eval_external_ref(sheet_name, ref)
             raise UnsupportedFormula(f"找不到工作表 {sheet_name}")
-        if ref.whole_column:
-            row2 = max(ws.max_row or 1, 1)
-        else:
-            row2 = ref.row2
+        row2 = max(ws.max_row or 1, 1) if ref.whole_column else ref.row2
+        formulas_ws = _lookup_sheet(self._formulas, sheet_name) if self._formulas else None
+        return self._collect(
+            ref,
+            row2,
+            lambda r, c: self._cell_value(self._book, sheet_name, ws, formulas_ws, r, c),
+        )
+
+    def _collect(self, ref: Ref, row2: int, get_cell):
+        """按引用取值：单元格返回标量，区域返回二维列表。"""
         if not ref.is_range:
-            return _coerce(ws.cell(row=ref.row1, column=ref.col1).value)
-        values = []
-        for row in range(ref.row1, row2 + 1):
-            values.append(
-                [_coerce(ws.cell(row=row, column=col).value) for col in range(ref.col1, ref.col2 + 1)]
+            return get_cell(ref.row1, ref.col1)
+        return [
+            [get_cell(row, col) for col in range(ref.col1, ref.col2 + 1)]
+            for row in range(ref.row1, row2 + 1)
+        ]
+
+    def _eval_external_ref(self, sheet_name: str, ref: Ref):
+        """跨工作簿引用：经外部加载器读缓存值，公式无缓存时递归本地求值。"""
+        if self.load_external is None:
+            raise UnsupportedFormula(
+                f"跨工作簿引用 {sheet_name} 无法本地验证（未启用外部工作簿加载）"
             )
-        return values
+        parent = self.book_path.parent if self.book_path else None
+        book, inner = self.load_external(sheet_name, parent)
+        if book is None:
+            raise UnsupportedFormula(f"跨工作簿引用 {sheet_name} 无法本地验证：{inner}")
+        ws_values = book.find_values(inner)
+        if ws_values is None:
+            raise UnsupportedFormula(
+                f"外部工作簿 {book.path.name} 中找不到工作表 {inner!r}"
+            )
+        ws_formulas = book.find_formulas(inner)
+        row2 = max(ws_values.max_row or 1, 1) if ref.whole_column else ref.row2
+        return self._collect(
+            ref,
+            row2,
+            lambda r, c: self._cell_value(book, inner, ws_values, ws_formulas, r, c),
+        )
+
+    def _cell_value(self, book, sheet_name: str, ws_values, ws_formulas, row: int, col: int):
+        """读工作簿单元格：优先缓存值；公式无缓存时——外部簿或 expand_uncached
+        模式递归本地求值，否则由 _coerce 抛出"未验证"（校验场景的保守语义）。
+        """
+        cell = ws_values.cell(row=row, column=col)
+        value = cell.value
+        if cell.data_type == "e":
+            return ExcelError(str(value))
+        if ws_formulas is not None and (
+            value is None or (isinstance(value, str) and value.startswith("="))
+        ):
+            raw = cell_formula_text(ws_formulas.cell(row=row, column=col))
+            if raw is not None and raw.startswith("="):
+                if book is not None:
+                    return self._eval_external_formula(book, sheet_name, row, col, raw)
+                if self._expand_uncached:
+                    return self._eval_local_formula(sheet_name, row, col, raw)
+                return _coerce(raw)
+        return _coerce(value)
+
+    def _eval_local_formula(self, sheet_name: str, row: int, col: int, formula_text: str):
+        """主簿内没有缓存值的公式递归本地求值（expand_uncached 模式）。
+
+        展示场景（如网页表格）希望像 Excel 一样给出结果，因此对链式依赖逐层
+        展开；校验场景保持默认关闭——引用未计算的公式即报"未验证"。带循环
+        检测、深度上限与结果缓存，语义与跨工作簿递归保持一致。
+        """
+        marker = f"{sheet_name}!{get_column_letter(col)}{row}"
+        key = ("<self>", sheet_name.casefold(), row, col)
+        if key in self._cache:
+            return self._cache[key]
+        if key in self._stack:
+            raise UnsupportedFormula(f"循环引用：{marker} 在求值链上重复出现")
+        if len(self._stack) >= _MAX_EXTERNAL_DEPTH:
+            raise UnsupportedFormula(f"公式引用链过深（超过 {_MAX_EXTERNAL_DEPTH} 层）：{marker}")
+        self._stack.add(key)
+        try:
+            try:
+                ast = parse_formula(formula_text)
+            except FormulaSyntaxError as exc:
+                raise UnsupportedFormula(f"公式 {marker} 无法解析：{exc}") from exc
+            nested = Evaluator(
+                self.sheets,
+                sheet_name,
+                load_external=self.load_external,
+                book_path=self.book_path,
+                current_cell=(row, col),
+                _stack=self._stack,
+                _formulas=self._formulas,
+                _expand_uncached=True,
+                _cache=self._cache,
+            )
+            value = nested.evaluate(ast)
+        finally:
+            self._stack.discard(key)
+        self._cache[key] = value
+        return value
+
+    def _eval_external_formula(self, book, sheet_name: str, row: int, col: int, formula_text: str):
+        """对外部工作簿里没有缓存值的公式做递归本地求值（带循环检测）。"""
+        marker = f"{book.path.name}!{sheet_name}!{get_column_letter(col)}{row}"
+        key = (str(book.path), sheet_name.casefold(), row, col)
+        if key in self._stack:
+            raise UnsupportedFormula(f"跨工作簿循环引用：{marker} 在求值链上重复出现")
+        if len(self._stack) >= _MAX_EXTERNAL_DEPTH:
+            raise UnsupportedFormula(f"跨工作簿引用链过深（超过 {_MAX_EXTERNAL_DEPTH} 层）：{marker}")
+        self._stack.add(key)
+        try:
+            try:
+                ast = parse_formula(formula_text)
+            except FormulaSyntaxError as exc:
+                raise UnsupportedFormula(f"外部公式 {marker} 无法解析：{exc}") from exc
+            nested = Evaluator(
+                book.values,
+                sheet_name,
+                load_external=self.load_external,
+                book_path=book.path,
+                current_cell=(row, col),
+                _stack=self._stack,
+                _book=book,
+                _formulas=book.formulas,
+            )
+            return nested.evaluate(ast)
+        finally:
+            self._stack.discard(key)
 
     def _eval_unary(self, node: Unary):
         value = self._eval(node.operand)
         if isinstance(value, ExcelError):
             return value
         if isinstance(value, list):
-            raise UnsupportedFormula(_ARRAY_IN_BINARY_HINT)
-        if node.op == "%":
-            return _to_number(value) / 100
-        number = _to_number(value)
-        if isinstance(number, ExcelError):
-            return number
-        return -number if node.op == "-" else number
+            # 区域/数组的一元运算：逐元素展开（-A1:A9、A1:A9% 等）
+            return _map_array(lambda item: _unary_scalar(node.op, item), value)
+        return _unary_scalar(node.op, value)
 
     def _eval_binary(self, node: Binary):
         left, right = self._eval(node.left), self._eval(node.right)
         for value in (left, right):
             if isinstance(value, ExcelError):
                 return value
-        # Excel 对区域参与运算走数组公式语义（逐元素展开），本地只做标量求值。
-        # 旧实现把区域塌缩成首元素再比较/计算，会给出静默算错的结果（例如
-        # (D2:D9="华北") 只比较了 D2），这里改为明确标记"未验证"。
         if isinstance(left, list) or isinstance(right, list):
-            raise UnsupportedFormula(_ARRAY_IN_BINARY_HINT)
-        op = node.op
-
-        if op == "&":
-            return _to_text(left) + _to_text(right)
-        if op in {"=", "<>", "<", ">", "<=", ">="}:
-            return _compare(op, left, right)
-
-        a, b = _to_number(left), _to_number(right)
-        if isinstance(a, ExcelError):
-            return a
-        if isinstance(b, ExcelError):
-            return b
-        if op == "+":
-            return a + b
-        if op == "-":
-            return a - b
-        if op == "*":
-            return a * b
-        if op == "/":
-            return DIV0 if b == 0 else a / b
-        if op == "^":
-            try:
-                return math.pow(a, b)
-            except (ValueError, OverflowError):
-                return NUM_ERR
-        raise UnsupportedFormula(f"不支持的运算符 {op}")
+            # 区域/数组参与运算按 Excel 数组语义逐元素展开。旧实现把区域塌缩
+            # 成首元素再比较/计算，会给出静默算错的结果（例如 (D2:D9="华北")
+            # 只比较了 D2），因此一度改为直接拒绝；现在按广播规则正确展开。
+            return _array_binary(node.op, left, right)
+        return _binary_scalar(node.op, left, right)
 
     # -------------------------------------------------------------- 函数实现
     def _eval_func(self, node: FuncCall):
@@ -243,21 +403,59 @@ class Evaluator:
             if index < len(node.args):  # 最后的落单参数是默认值
                 return _single(self._eval(node.args[index]))
             return NA_ERR
+        if name in {"ROW", "COLUMN"}:
+            # 行列信息只存在于引用坐标里，已求值的参数会丢失，须直接看 AST
+            return self._eval_position_func(name, node)
         args = [self._eval(arg) for arg in node.args]
         for arg in args:
             if isinstance(arg, ExcelError) and name not in {"ISERROR", "ISERR", "ISNA"}:
                 return arg
         return handler(args)
 
+    def _eval_position_func(self, name: str, node: FuncCall):
+        """ROW()/COLUMN()：无参返回公式所在单元格的行/列号；带引用参数返回该引用的
+        首行/首列，区域形式按数组返回整段行/列号（标量上下文经隐式交叉取首值，
+        与 Excel 行为一致）。整列引用拿不到有效行范围，保守报未验证。"""
+        if not node.args:
+            if self.current_cell is None:
+                raise UnsupportedFormula(f"无法确定公式所在单元格，暂不验证 {name}()")
+            return float(self.current_cell[0] if name == "ROW" else self.current_cell[1])
+        target = node.args[0]
+        if not isinstance(target, Ref):
+            raise UnsupportedFormula(f"{name} 的参数必须是单元格或区域引用")
+        if name == "ROW":
+            if target.whole_column:
+                raise UnsupportedFormula("本地验证暂不支持对整列引用使用 ROW")
+            if target.row2 > target.row1:
+                return [[float(row)] for row in range(target.row1, target.row2 + 1)]
+            return float(target.row1)
+        if target.col2 > target.col1:
+            return [[float(col) for col in range(target.col1, target.col2 + 1)]]
+        return float(target.col1)
+
 
 # ------------------------------------------------------------------ 值处理工具
+def _lookup_sheet(sheets, name: str):
+    """Excel 的工作表名不区分大小写：先精确命中，再大小写不敏感兜底。"""
+    if not sheets:
+        return None
+    ws = sheets.get(name)
+    if ws is not None:
+        return ws
+    lowered = name.casefold()
+    for key, ws in sheets.items():
+        if key.casefold() == lowered:
+            return ws
+    return None
+
+
 def _coerce(value: object):
     if isinstance(value, str) and value.startswith("="):
         # data_only 视图里仍是公式，说明该单元格没有缓存值
         raise UnsupportedFormula("引用的单元格是尚未计算的公式，无法本地验证")
     if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
-        # 不在这里报错：VLOOKUP/SUMIFS 等按行取值的函数可能根本不碰这一列日期，
-        # 真正参与运算时由 _to_number/_to_text 等算子抛出"未验证"。
+        # 包装成 DateValue：算术与比较按序列号进行；纯取值场景（如 VLOOKUP
+        # 按行命中日期列）原样返回，以 ISO 文本展示。
         return DateValue(value)
     return value
 
@@ -329,11 +527,101 @@ def _if_at(condition, yes, no, row: int, col: int):
     return _at(yes, row, col) if _to_bool(chosen) else _at(no, row, col)
 
 
+def _broadcastable(size_a: int, size_b: int) -> bool:
+    """数组广播兼容性：两侧尺寸相等，或任一为 1（沿该维伸展）。"""
+    return size_a == size_b or size_a == 1 or size_b == 1
+
+
+def _array_binary(op: str, left, right):
+    """区域/数组参与二元运算的数组语义：先定广播形状，再逐元素按标量规则计算。
+
+    形状规则与 IF 的数组形式一致（共用 _layer_count/_layer_width/_at）。维度不
+    兼容（两侧都大于 1 且不相等，如 8 行比 6 行）时返回 #N/A——Excel 对尺寸不
+    匹配的数组运算用 #N/A 填充缺失元素；这里宁可给出明确错误，也不钳制出
+    "看起来正常"的静默算错结果。
+    """
+    left_rows, left_cols = _layer_count(left), _layer_width(left)
+    right_rows, right_cols = _layer_count(right), _layer_width(right)
+    if not _broadcastable(left_rows, right_rows) or not _broadcastable(left_cols, right_cols):
+        return NA_ERR
+    rows = max(left_rows, right_rows)
+    cols = max(left_cols, right_cols)
+    return [
+        [_binary_scalar(op, _at(left, row, col), _at(right, row, col)) for col in range(cols)]
+        for row in range(rows)
+    ]
+
+
+def _map_array(func, value):
+    """对整个数组逐元素应用标量函数（一元运算复用），形状规整为二维。"""
+    return [
+        [func(_at(value, row, col)) for col in range(_layer_width(value))]
+        for row in range(_layer_count(value))
+    ]
+
+
+_ARRAY_NATIVE_FUNCS = {"SUMPRODUCT"}
+
+
+def needs_array_formula(node) -> bool:
+    """AST 判定：公式是否需要以数组公式（CSE）形态写入文件。
+
+    区域参与一元/二元运算（含比较）的公式本地按数组语义求值；但若以普通公式
+    文本写入 .xlsx，Excel/WPS 打开时会按传统"隐式交叉"只取与公式同行/列交叉
+    的单值，与本地结果不一致。以数组公式形态写入即可在各版本还原数组语义。
+
+    SUMPRODUCT 除外：其参数天然按数组处理，各版本都会正确求值，不需要 CSE。
+    """
+    if isinstance(node, FuncCall):
+        name = node.name.upper()
+        if name in _ARRAY_NATIVE_FUNCS:
+            return False
+        if name in {"ROW", "COLUMN"} and any(
+            isinstance(arg, Ref) and arg.is_range for arg in node.args
+        ):
+            # ROW(A1:A5) 这类区域形式返回数组，裸公式会被旧版 Excel/WPS
+            # 隐式交叉成单值，需要 CSE 才能还原数组语义
+            return True
+        if name == "IF" and any(_could_be_array(arg) for arg in node.args):
+            return True
+        return any(needs_array_formula(arg) for arg in node.args)
+    if isinstance(node, Unary):
+        if _could_be_array(node.operand):
+            return True
+        return needs_array_formula(node.operand)
+    if isinstance(node, Binary):
+        if _could_be_array(node.left) or _could_be_array(node.right):
+            return True
+        return needs_array_formula(node.left) or needs_array_formula(node.right)
+    return False
+
+
+def _could_be_array(node) -> bool:
+    """子表达式求值是否可能得到数组：区域、数组字面量，或数组形式的 IF。"""
+    if isinstance(node, Ref):
+        return node.is_range
+    if isinstance(node, ArrayLiteral):
+        return True
+    if isinstance(node, Unary):
+        return _could_be_array(node.operand)
+    if isinstance(node, Binary):
+        return _could_be_array(node.left) or _could_be_array(node.right)
+    if isinstance(node, FuncCall):
+        name = node.name.upper()
+        if name in {"ROW", "COLUMN"} and any(
+            isinstance(arg, Ref) and arg.is_range for arg in node.args
+        ):
+            return True
+        return name == "IF" and any(_could_be_array(arg) for arg in node.args)
+    return False
+
+
 def _numbers(values) -> list[float]:
     out: list[float] = []
     for item in _flatten(values):
         if isinstance(item, DateValue):
-            raise UnsupportedFormula(DATE_HINT)
+            out.append(_to_serial(item.raw))  # 日期按序列号参与汇总（与 Excel 一致）
+            continue
         if isinstance(item, bool) or item is None or isinstance(item, ExcelError):
             continue
         if isinstance(item, (int, float)):
@@ -341,9 +629,18 @@ def _numbers(values) -> list[float]:
     return out
 
 
+def _aggregate_number(value):
+    """条件汇总的取值：日期 → 序列号，数字原样，其余返回 None（按忽略处理）。"""
+    if isinstance(value, DateValue):
+        return _to_serial(value.raw)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def _to_number(value):
     if isinstance(value, DateValue):
-        raise UnsupportedFormula(DATE_HINT)
+        return _to_serial(value.raw)  # 日期在 Excel 里就是数字：序列号
     if value is None:
         return 0.0
     if isinstance(value, bool):
@@ -360,7 +657,9 @@ def _to_number(value):
 
 def _to_text(value) -> str:
     if isinstance(value, DateValue):
-        raise UnsupportedFormula(DATE_HINT)
+        # 单元格数字格式本地不可知，统一用 ISO 文本：既可直接阅读，也让
+        # ">="&DATE(...) 这类拼接出的条件文本能被 _parse_date_text 还原成日期
+        return _date_text(value.raw)
     if value is None:
         return ""
     if isinstance(value, bool):
@@ -372,7 +671,7 @@ def _to_text(value) -> str:
 
 def _to_bool(value) -> bool:
     if isinstance(value, DateValue):
-        raise UnsupportedFormula(DATE_HINT)
+        return _to_serial(value.raw) != 0
     if value is None:
         return False
     if isinstance(value, bool):
@@ -383,20 +682,28 @@ def _to_bool(value) -> bool:
 
 
 def _typed(value):
-    """类型判断类函数的取值：日期在 Excel 里属于数字（序列号），
-    本地无序列号语义，归到哪一类都给不出准确答案，统一标"未验证"。"""
+    """类型判断类函数的取值：日期在 Excel 里属于数字（序列号）。"""
     if isinstance(value, DateValue):
-        raise UnsupportedFormula(DATE_HINT)
+        return _to_serial(value.raw)
     return value
 
 
 def _compare(op: str, left, right):
+    if isinstance(left, DateValue) or isinstance(right, DateValue):
+        a, b = _date_side(left), _date_side(right)
+        if a is None or b is None:
+            raise UnsupportedFormula(DATE_HINT)
+        return _order(op, a, b)
     if isinstance(left, str) or isinstance(right, str):
         a, b = _to_text(left).upper(), _to_text(right).upper()
     else:
         a, b = _to_number(left), _to_number(right)
         if isinstance(a, ExcelError) or isinstance(b, ExcelError):
             return VALUE_ERR
+    return _order(op, a, b)
+
+
+def _order(op: str, a, b):
     if op == "=":
         return a == b
     if op == "<>":
@@ -408,6 +715,101 @@ def _compare(op: str, left, right):
     if op == "<=":
         return a <= b
     return a >= b
+
+
+def _date_side(value):
+    """日期参与比较时把两侧折算成序列号；无法折算返回 None（上层标"未验证"）。"""
+    if isinstance(value, DateValue):
+        return _to_serial(value.raw)
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if value is None:
+        return 0.0
+    if isinstance(value, str):
+        parsed = _parse_date_text(value)
+        return None if parsed is None else _to_serial(parsed)
+    return None
+
+
+def _date_arithmetic(op: str, left, right):
+    """日期参与 +- 的 Excel 语义：日期±天数仍是日期，日期-日期是天数差。
+
+    其余组合（日期×数字等）返回 None，交给通用数值路径按序列号计算。
+    """
+    left_date = isinstance(left, DateValue)
+    right_date = isinstance(right, DateValue)
+    try:
+        if left_date and isinstance(right, (int, float)) and not isinstance(right, bool):
+            delta = _dt.timedelta(days=float(right))
+            return DateValue(left.raw + delta if op == "+" else left.raw - delta)
+        if right_date and isinstance(left, (int, float)) and not isinstance(left, bool):
+            if op == "+":
+                return DateValue(right.raw + _dt.timedelta(days=float(left)))
+            return _to_serial(left) - _to_serial(right.raw)
+        if left_date and right_date:
+            a, b = _to_serial(left.raw), _to_serial(right.raw)
+            return a + b if op == "+" else a - b
+    except OverflowError:
+        return NUM_ERR
+    return None
+
+
+def _unary_scalar(op: str, value):
+    """一元运算的标量规则；数组路径对每个元素复用同一语义。"""
+    if isinstance(value, ExcelError):
+        return value
+    if op == "%":
+        number = _to_number(value)
+        return number if isinstance(number, ExcelError) else number / 100
+    number = _to_number(value)
+    if isinstance(number, ExcelError):
+        return number
+    return -number if op == "-" else number
+
+
+def _binary_scalar(op: str, left, right):
+    """二元运算的标量规则；数组路径按元素对复用这里，保证语义一致。"""
+    for value in (left, right):
+        if isinstance(value, ExcelError):
+            return value
+    if op == "&":
+        return _to_text(left) + _to_text(right)
+    if op in {"=", "<>", "<", ">", "<=", ">="}:
+        return _compare(op, left, right)
+    if op in {"+", "-"}:
+        dated = _date_arithmetic(op, left, right)
+        if dated is not None:
+            return dated
+    a, b = _to_number(left), _to_number(right)
+    if isinstance(a, ExcelError):
+        return a
+    if isinstance(b, ExcelError):
+        return b
+    if op == "+":
+        return a + b
+    if op == "-":
+        return a - b
+    if op == "*":
+        return a * b
+    if op == "/":
+        return DIV0 if b == 0 else a / b
+    if op == "^":
+        try:
+            return math.pow(a, b)
+        except (ValueError, OverflowError):
+            return NUM_ERR
+    raise UnsupportedFormula(f"不支持的运算符 {op}")
+
+
+def _date_text(raw) -> str:
+    """日期值的文本形式：零点整的 datetime 等价于 date，其余带上时间部分。"""
+    if isinstance(raw, _dt.datetime):
+        if raw.time() == _dt.time(0, 0):
+            return raw.date().isoformat()
+        return f"{raw.date().isoformat()} {raw.time().isoformat()}"
+    return raw.isoformat()
 
 
 _CRITERIA_RE = re.compile(r"^\s*(<=|>=|<>|=|<|>)?\s*(.*)$", re.DOTALL)
@@ -426,6 +828,10 @@ def _match_criteria(value, criteria) -> bool:
         operand = operand_text
     if isinstance(operand, str) and ("*" in operand or "?" in operand):
         raise UnsupportedFormula("本地验证不支持通配符条件")
+    if isinstance(operand, str) and isinstance(value, DateValue):
+        parsed = _parse_date_text(operand)
+        if parsed is not None:
+            operand = _to_serial(parsed)  # ">2025-01-15" 这类日期文本条件
     if value is None and op in {"=", "<>"}:
         return (operand_text == "") if op == "=" else (operand_text != "")
     result = _compare(op, value, operand)
@@ -444,13 +850,13 @@ def _sum_if(args, *, mode: str):
     values = _flatten(target)
     if len(values) < len(source):
         raise UnsupportedFormula("条件区域与求和区域大小不一致")
-    picked = [
-        values[i]
-        for i, item in enumerate(source)
-        if _match_criteria(item, criteria) and isinstance(values[i], (int, float))
-        and not isinstance(values[i], bool)
-    ]
-    numbers = [float(v) for v in picked]
+    numbers: list[float] = []
+    for item, value in zip(source, values):
+        if not _match_criteria(item, criteria):
+            continue
+        number = _aggregate_number(value)
+        if number is not None:
+            numbers.append(number)
     if mode == "SUMIF":
         return math.fsum(numbers)
     return math.fsum(numbers) / len(numbers) if numbers else DIV0
@@ -481,11 +887,12 @@ def _multi_criteria(args, *, mode: str):
             hits.append(index)
     if mode == "COUNTIFS":
         return float(len(hits))
-    numbers = [
-        float(sum_range[i])
-        for i in hits
-        if i < len(sum_range) and isinstance(sum_range[i], (int, float)) and not isinstance(sum_range[i], bool)
-    ]
+    numbers: list[float] = []
+    for index in hits:
+        if index < len(sum_range):
+            number = _aggregate_number(sum_range[index])
+            if number is not None:
+                numbers.append(number)
     if mode == "SUMIFS":
         return math.fsum(numbers)
     return math.fsum(numbers) / len(numbers) if numbers else DIV0
@@ -720,9 +1127,10 @@ def _conditional_extreme(args, mode: str):
             if not _match_criteria(flat[index], _single(criteria)):
                 ok = False
                 break
-        value = target[index]
-        if ok and isinstance(value, (int, float)) and not isinstance(value, bool):
-            picked.append(float(value))
+        if ok:
+            number = _aggregate_number(target[index])
+            if number is not None:
+                picked.append(number)
     if not picked:
         return 0.0  # 没有任何满足条件的数值时 Excel 返回 0
     return max(picked) if mode == "MAX" else min(picked)
@@ -883,6 +1291,252 @@ def _parity(args, *, want_even: bool):
     return remainder == 0 if want_even else remainder == 1
 
 
+# ------------------------------------------------------------------ 日期时间
+# 全部按 1900 日期系统（1899-12-30 = 序列号 0）实现，与 Excel 的日期序列号一致。
+def _require_serial(node_value):
+    """日期函数的参数 → 序列号：日期对象折算，数字原样，日期文本尝试解析。"""
+    value = _single(node_value)
+    if isinstance(value, str):
+        parsed = _parse_date_text(value)
+        if parsed is not None:
+            return _to_serial(parsed)
+    return _to_number(value)
+
+
+def _date_func(args):
+    """DATE：年月日 → 日期。月份/日期溢出按 Excel 规则进位，0~1899 的年自动加 1900。"""
+    year = _require_int(args[0])
+    month = _require_int(args[1])
+    day = _require_int(args[2])
+    for number in (year, month, day):
+        if isinstance(number, ExcelError):
+            return number
+    if year < 0:
+        return NUM_ERR
+    if year < 1900:
+        year += 1900
+    if year > 9999:
+        return NUM_ERR
+    year += (month - 1) // 12
+    month = (month - 1) % 12 + 1
+    try:
+        return DateValue(_dt.date(year, month, 1) + _dt.timedelta(days=day - 1))
+    except (ValueError, OverflowError):
+        return NUM_ERR
+
+
+def _date_part(args, mode: str):
+    serial = _require_serial(args[0])
+    if isinstance(serial, ExcelError):
+        return serial
+    raw = _from_serial(serial).raw
+    return float({"Y": raw.year, "M": raw.month, "D": raw.day}[mode])
+
+
+def _time_part(args, mode: str):
+    serial = _require_serial(args[0])
+    if isinstance(serial, ExcelError):
+        return serial
+    total = round((serial - math.floor(serial)) * 86400)
+    hours, remaining = divmod(total, 3600)
+    minutes, seconds = divmod(remaining, 60)
+    return float({"H": hours, "M": minutes, "S": seconds}[mode])
+
+
+def _datevalue(args):
+    text = _single(args[0])
+    if isinstance(text, str):
+        parsed = _parse_date_text(text)
+        if parsed is not None:
+            return DateValue(parsed)
+    return VALUE_ERR
+
+
+def _add_months(day: _dt.date, months: int) -> _dt.date:
+    total = day.year * 12 + (day.month - 1) + months
+    year, month = divmod(total, 12)
+    month += 1
+    return _dt.date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def _full_months(start: _dt.date, end: _dt.date) -> int:
+    months = (end.year - start.year) * 12 + end.month - start.month
+    if end.day < start.day:
+        months -= 1
+    return max(months, 0)
+
+
+def _full_years(start: _dt.date, end: _dt.date) -> int:
+    years = end.year - start.year
+    if (end.month, end.day) < (start.month, start.day):
+        years -= 1
+    return max(years, 0)
+
+
+def _shift_years(day: _dt.date, years: int) -> _dt.date:
+    try:
+        return day.replace(year=day.year + years)
+    except ValueError:  # 2 月 29 日在目标年不存在
+        return _dt.date(day.year + years, 2, 28)
+
+
+def _edate(args):
+    """EDATE：按月份偏移得到同一天（目标月天数不足时取月末）。"""
+    serial = _require_serial(args[0])
+    months = _require_int(args[1])
+    for number in (serial, months):
+        if isinstance(number, ExcelError):
+            return number
+    try:
+        return DateValue(_add_months(_as_date(_from_serial(serial).raw), months))
+    except (ValueError, OverflowError):
+        return NUM_ERR
+
+
+def _eomonth(args):
+    """EOMONTH：月份偏移后取该月最后一天。"""
+    serial = _require_serial(args[0])
+    months = _require_int(args[1])
+    for number in (serial, months):
+        if isinstance(number, ExcelError):
+            return number
+    try:
+        day = _as_date(_from_serial(serial).raw)
+        shifted = _add_months(_dt.date(day.year, day.month, 1), months)
+        last = calendar.monthrange(shifted.year, shifted.month)[1]
+        return DateValue(_dt.date(shifted.year, shifted.month, last))
+    except (ValueError, OverflowError):
+        return NUM_ERR
+
+
+def _days(args):
+    end = _require_serial(args[0])
+    start = _require_serial(args[1])
+    for value in (end, start):
+        if isinstance(value, ExcelError):
+            return value
+    return end - start
+
+
+def _datedif(args):
+    """DATEDIF：两日期的整年/整月/天数差，支持 Y/M/D/YM/YD/MD 单位。"""
+    unit = _to_text(_single(args[2])).strip().upper()
+    start = _require_serial(args[0])
+    end = _require_serial(args[1])
+    for value in (start, end):
+        if isinstance(value, ExcelError):
+            return value
+    if end < start:
+        return NUM_ERR
+    start_day = _as_date(_from_serial(start).raw)
+    end_day = _as_date(_from_serial(end).raw)
+    if unit == "D":
+        return float((end_day - start_day).days)
+    if unit == "Y":
+        return float(_full_years(start_day, end_day))
+    if unit == "M":
+        return float(_full_months(start_day, end_day))
+    if unit == "YM":
+        return float(_full_months(start_day, end_day) % 12)
+    if unit == "YD":
+        anchor = _shift_years(start_day, _full_years(start_day, end_day))
+        return float((end_day - anchor).days)
+    if unit == "MD":
+        if end_day.day >= start_day.day:
+            return float(end_day.day - start_day.day)
+        borrowed = _add_months(_dt.date(end_day.year, end_day.month, 1), -1)
+        return float(
+            end_day.day + calendar.monthrange(borrowed.year, borrowed.month)[1] - start_day.day
+        )
+    return NUM_ERR
+
+
+def _weekday(args):
+    """WEEKDAY：1=周日..7=周六（默认）；2=周一..7=周日；3=周一=0；11~17 为周一起算的变体。"""
+    serial = _require_serial(args[0])
+    if isinstance(serial, ExcelError):
+        return serial
+    kind = _require_int(args[1]) if len(args) > 1 else 1
+    if isinstance(kind, ExcelError):
+        return kind
+    weekday = _as_date(_from_serial(serial).raw).weekday()  # 周一=0 … 周日=6
+    if kind == 1:
+        return float((weekday + 1) % 7 + 1)
+    if kind == 2:
+        return float(weekday + 1)
+    if kind == 3:
+        return float(weekday)
+    if 11 <= kind <= 17:
+        return float((weekday - (kind - 11)) % 7 + 1)
+    return NUM_ERR
+
+
+def _weeknum(args):
+    """WEEKNUM：1=周日为一周起点（默认），2=周一为一周起点。"""
+    serial = _require_serial(args[0])
+    if isinstance(serial, ExcelError):
+        return serial
+    kind = _require_int(args[1]) if len(args) > 1 else 1
+    if isinstance(kind, ExcelError):
+        return kind
+    if kind not in (1, 2):
+        return NUM_ERR
+    day = _as_date(_from_serial(serial).raw)
+    january_first = _dt.date(day.year, 1, 1)
+    offset = (january_first.weekday() + 1) % 7 if kind == 1 else january_first.weekday()
+    return float(((day - january_first).days + offset) // 7 + 1)
+
+
+def _holiday_dates(node_value) -> set:
+    """节假日参数（区域/数组）→ date 集合；无法识别的项忽略。"""
+    days: set = set()
+    for item in _flatten(node_value):
+        if isinstance(item, DateValue):
+            days.add(_as_date(item.raw))
+        elif isinstance(item, (int, float)) and not isinstance(item, bool):
+            days.add(_as_date(_from_serial(float(item)).raw))
+        elif isinstance(item, str):
+            parsed = _parse_date_text(item)
+            if parsed is not None:
+                days.add(parsed.date())
+    return days
+
+
+def _networkdays(args):
+    start = _require_serial(args[0])
+    end = _require_serial(args[1])
+    for value in (start, end):
+        if isinstance(value, ExcelError):
+            return value
+    holidays = _holiday_dates(args[2]) if len(args) > 2 else set()
+    first, last = int(start), int(end)
+    if first > last:
+        first, last = last, first
+    count = 0
+    for serial in range(first, last + 1):
+        day = _as_date(_from_serial(float(serial)).raw)
+        if day.weekday() < 5 and day not in holidays:
+            count += 1
+    return float(count)
+
+
+def _workday(args):
+    serial = _require_serial(args[0])
+    offset = _require_int(args[1])
+    for value in (serial, offset):
+        if isinstance(value, ExcelError):
+            return value
+    holidays = _holiday_dates(args[2]) if len(args) > 2 else set()
+    day = _as_date(_from_serial(serial).raw)
+    step = 1 if offset >= 0 else -1
+    remaining = abs(offset)
+    while remaining:
+        day += _dt.timedelta(days=step)
+        if day.weekday() < 5 and day not in holidays:
+            remaining -= 1
+    return DateValue(day)
+
+
 _FUNCTIONS: dict[str, object] = {
     "SUM": lambda a: math.fsum(_numbers(a)),
     "PRODUCT": lambda a: math.prod(_numbers(a)) if _numbers(a) else 0.0,
@@ -934,6 +1588,8 @@ _FUNCTIONS: dict[str, object] = {
     "COLUMNS": lambda a: float(
         len(a[0][0]) if isinstance(a[0], list) and a[0] and isinstance(a[0][0], list) else 1
     ),
+    "ROW": lambda a: None,  # 由 Evaluator 特殊处理（无参形式需要公式所在位置）
+    "COLUMN": lambda a: None,
     "LEN": lambda a: float(len(_to_text(_single(a[0])))),
     "TRIM": lambda a: _text_func(a, lambda s: s.strip()),
     "UPPER": lambda a: _text_func(a, str.upper),
@@ -996,12 +1652,61 @@ _FUNCTIONS: dict[str, object] = {
     "VAR.P": lambda a: _safe_div(_numbers(a), statistics.pvariance),
     "STDEVP": lambda a: _safe_div(_numbers(a), statistics.pstdev),
     "SUMPRODUCT": _sumproduct,
+    # 日期时间族
+    "TODAY": lambda a: DateValue(_dt.date.today()),
+    "NOW": lambda a: DateValue(_dt.datetime.now().replace(microsecond=0)),
+    "DATE": _date_func,
+    "YEAR": lambda a: _date_part(a, "Y"),
+    "MONTH": lambda a: _date_part(a, "M"),
+    "DAY": lambda a: _date_part(a, "D"),
+    "HOUR": lambda a: _time_part(a, "H"),
+    "MINUTE": lambda a: _time_part(a, "M"),
+    "SECOND": lambda a: _time_part(a, "S"),
+    "WEEKDAY": _weekday,
+    "WEEKNUM": _weeknum,
+    "EOMONTH": _eomonth,
+    "EDATE": _edate,
+    "DATEDIF": _datedif,
+    "DAYS": _days,
+    "DATEVALUE": _datevalue,
+    "NETWORKDAYS": _networkdays,
+    "WORKDAY": _workday,
 }
 
 
-def evaluate_formula(ast: object, sheets: dict[str, Worksheet], default_sheet: str):
-    """对外接口：求值成功返回结果值，不支持时抛出 UnsupportedFormula。"""
-    return Evaluator(sheets, default_sheet).evaluate(ast)
+def evaluate_formula(
+    ast: object,
+    sheets: dict[str, Worksheet],
+    default_sheet: str,
+    *,
+    load_external=None,
+    book_path: str | Path | None = None,
+    formula_sheets: dict[str, Worksheet] | None = None,
+    expand_uncached: bool = False,
+    current_cell: tuple[int, int] | None = None,
+):
+    """对外接口：求值成功返回结果值，不支持时抛出 UnsupportedFormula。
+
+    传入 load_external（ExternalBookLoader 实例或等价可调用对象）后，跨工作簿
+    引用会尝试打开外部工作簿试算；book_path 是当前工作簿路径，用于解析公式里
+    省略目录的外部引用（按同目录查找）。
+
+    expand_uncached=True 时，主簿里引用到"没有缓存值的公式单元格"也会递归本地
+    求值（展示场景用，让链式公式也能显示结果）；默认 False——校验场景把未计算
+    的公式视为不可信输入，直接报"未验证"。
+
+    current_cell=(行, 列) 是公式所在单元格位置，供 ROW()/COLUMN() 无参形式求值；
+    调用方给不出位置时传 None，这两个函数按"未验证"处理。
+    """
+    return Evaluator(
+        sheets,
+        default_sheet,
+        load_external=load_external,
+        book_path=book_path,
+        current_cell=current_cell,
+        _formulas=formula_sheets,
+        _expand_uncached=expand_uncached,
+    ).evaluate(ast)
 
 
 def format_value(value) -> str:

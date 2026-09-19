@@ -20,6 +20,7 @@ from .formula_parser import (
     ErrorLiteral,
     FormulaSyntaxError,
     FuncCall,
+    is_external_sheet,
     Ref,
     parse_formula,
     parse_target,
@@ -52,6 +53,9 @@ ARITY: dict[str, tuple[int, int | None]] = {
     "CONCATENATE": (1, None), "REPT": (2, 2), "CHAR": (1, 1), "CODE": (1, 1),
     "TODAY": (0, 0), "NOW": (0, 0), "DATE": (3, 3), "YEAR": (1, 1), "MONTH": (1, 1),
     "DAY": (1, 1), "DATEDIF": (3, 3), "EOMONTH": (2, 2), "EDATE": (2, 2),
+    "HOUR": (1, 1), "MINUTE": (1, 1), "SECOND": (1, 1), "WEEKDAY": (1, 2),
+    "WEEKNUM": (1, 2), "DAYS": (2, 2), "DATEVALUE": (1, 1),
+    "NETWORKDAYS": (2, 3), "WORKDAY": (2, 3),
     "ISBLANK": (1, 1), "ISNUMBER": (1, 1), "ISTEXT": (1, 1), "ISERROR": (1, 1),
     "ISERR": (1, 1), "ISNA": (1, 1), "ISEVEN": (1, 1), "ISODD": (1, 1), "NA": (0, 0),
     "TRUE": (0, 0), "FALSE": (0, 0),
@@ -116,7 +120,7 @@ def validate_formula(
 
     _check_functions(nodes, errors, warnings)
     _check_identifiers(nodes, errors)
-    _check_sheets(refs, sheet_names, errors)
+    _check_sheets(refs, sheet_names, errors, warnings)
     _check_ranges(refs, digest, sheet, warnings, errors)
     _check_target(target, sheet, refs, digest, errors, warnings)
 
@@ -167,14 +171,28 @@ def _check_identifiers(nodes: list, errors: list[str]) -> None:
             )
 
 
-def _check_sheets(refs: list[Ref], sheet_names: list[str] | None, errors: list[str]) -> None:
+def _check_sheets(
+    refs: list[Ref], sheet_names: list[str] | None, errors: list[str], warnings: list[str]
+) -> None:
     if not sheet_names:
         return
+    external: list[str] = []
     for ref in refs:
-        if ref.sheet and ref.sheet not in sheet_names:
+        if not ref.sheet:
+            continue
+        if is_external_sheet(ref.sheet):
+            if ref.sheet not in external:
+                external.append(ref.sheet)
+            continue
+        if ref.sheet not in sheet_names:
             errors.append(
                 f"引用的工作表 {ref.sheet!r} 不存在，可用工作表：{', '.join(sheet_names)}"
             )
+    for name in external:
+        warnings.append(
+            f"跨工作簿引用 {name}：本地试算会尝试按公式位置读取该工作簿，"
+            "写入后能否算出结果取决于打开时外部工作簿是否可用"
+        )
 
 
 def _check_ranges(

@@ -78,6 +78,55 @@ def sales_xlsx(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
+def class_xlsx(tmp_path: Path) -> Path:
+    """两张中文表：成绩单（数据源）与班级信息（目标），复刻“班级信息表教室列后面…”指令场景。"""
+    workbook = Workbook()
+    scores = workbook.active
+    scores.title = "成绩单"
+    scores.append(["姓名", "班级", "成绩"])
+    for row in [["张三", "一班", 90], ["李四", "一班", 80], ["王五", "二班", 70], ["赵六", "二班", 60]]:
+        scores.append(row)
+    info = workbook.create_sheet("班级信息")
+    info.append(["班级", "班主任", "教室"])
+    info.append(["一班", "刘老师", "101"])
+    info.append(["二班", "陈老师", "102"])
+    path = tmp_path / "成绩表.xlsx"
+    workbook.save(path)
+    workbook.close()
+    return path
+
+
+@pytest.fixture()
+def class_scores_xlsx(tmp_path: Path) -> Path:
+    """真实除零场景：学号/姓名/班级/三科成绩，平均分列为空且表尾有统计区。"""
+    workbook = Workbook()
+    scores = workbook.active
+    scores.title = "成绩单"
+    scores.append(["学号", "姓名", "班级", "语文", "数学", "英语", "总分", "平均分", "评级"])
+    marks = [
+        (88, 92, 85), (76, 68, 90), (95, 88, 92), (52, 61, 47),
+        (79, 83, 74), (91, 78, 84), (68, 72, 77), (85, 93, 81),
+        (73, 66, 69), (90, 87, 89), (64, 59, 72), (82, 90, 76),
+    ]
+    for index, grades in enumerate(marks, start=1):
+        scores.append([f"S{index:02}", f"学生{index}", f"高一{(index - 1) // 4 + 1}班", *grades])
+    scores["A15"] = "统计区"
+    scores["A18"] = "英语最高分"
+    info = workbook.create_sheet("班级信息")
+    info.append(["班级", "班主任", "教室", "班级学生平均成绩"])
+    for index in range(1, 4):
+        row = index + 1
+        info.append([
+            f"高一{index}班", f"老师{index}", 300 + index,
+            f"=AVERAGEIF(成绩单!$A$2:$A$100,A{row},成绩单!$B$2:$B$100)",
+        ])
+    path = tmp_path / "班级成绩.xlsx"
+    workbook.save(path)
+    workbook.close()
+    return path
+
+
+@pytest.fixture()
 def settings(tmp_path: Path) -> Settings:
     return Settings(
         api_key="sk-test-key-not-real",

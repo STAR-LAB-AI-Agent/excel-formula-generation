@@ -118,7 +118,11 @@ class Token:
     position: int
 
 
-_SHEET = r"(?:'(?:[^']|'')+'|[A-Za-z_\u4e00-\u9fff][A-Za-z0-9_.\u4e00-\u9fff]*)!"
+# 工作表引用：'名字'! 或 名字!；名字可带 [book] 前缀（跨工作簿引用，如 [book2]Sheet1!）
+_SHEET = (
+    r"(?:'(?:[^']|'')+'"
+    r"|(?:\[[^\]!]+\])?[A-Za-z_\u4e00-\u9fff][A-Za-z0-9_.\u4e00-\u9fff]*)!"
+)
 _A1 = r"\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6}"
 
 TOKEN_RE = re.compile(
@@ -407,6 +411,14 @@ def _clean_sheet(text: str) -> str:
     return name
 
 
+_EXTERNAL_SHEET_RE = re.compile(r"\[[^\]]+\]")
+
+
+def is_external_sheet(name: str | None) -> bool:
+    """工作表名是否指向其他工作簿（如 [book2]Sheet1 或 'C:\\x\\[book2.xlsx]Sheet1'）。"""
+    return bool(name) and bool(_EXTERNAL_SHEET_RE.search(name))
+
+
 def _split_coord(coord: str) -> tuple[int, int]:
     match = re.fullmatch(r"\$?([A-Za-z]{1,3})\$?([0-9]{1,7})", coord.strip())
     if not match:
@@ -465,3 +477,31 @@ def parse_target(target: str) -> tuple[str | None, int, int]:
         raise FormulaSyntaxError(f"目标必须是单个单元格，不能是区域：{target}")
     col, row = _split_coord(text)
     return sheet, col, row
+
+
+def parse_range(text: str) -> Ref:
+    """解析区域引用，如 'A2:D10'（也接受单个单元格 'C3'），返回规整后的 Ref。
+
+    面向非公式场景（如模型给出的新建表格范围）：忽略 $ 与空格、拒绝工作表前缀，
+    起止坐标无论顺序都规整为左上/右下，便于后续按行列遍历。
+    """
+    body = (text or "").strip().replace(" ", "")
+    if not body:
+        raise FormulaSyntaxError("区域不能为空")
+    if "!" in body:
+        raise FormulaSyntaxError(f"区域不能带工作表前缀：{text}")
+    parts = body.split(":")
+    if len(parts) > 2:
+        raise FormulaSyntaxError(f"非法区域 {text!r}")
+    col1, row1 = _split_coord(parts[0])
+    col2, row2 = (col1, row1) if len(parts) == 1 else _split_coord(parts[1])
+    if min(row1, row2) < 1:
+        raise FormulaSyntaxError(f"区域行号必须从 1 开始：{text}")
+    return Ref(
+        text=body,
+        col1=min(col1, col2),
+        row1=min(row1, row2),
+        col2=max(col1, col2),
+        row2=max(row1, row2),
+        is_range=len(parts) == 2,
+    )

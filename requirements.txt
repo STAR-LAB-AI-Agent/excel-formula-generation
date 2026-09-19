@@ -1,5 +1,7 @@
 # 运行时依赖
 openpyxl==3.1.5
 requests==2.32.3
+# 保留 Excel 中已有图片：openpyxl 读取/重写文件内图片依赖 Pillow
+Pillow==10.4.0
 # 测试依赖（本机已验证 7.4.4）
 pytest>=7.4

@@ -25,6 +25,8 @@
 | T18 | 实景 | `在动态数据统计图表的E2按负责人汇总销售额` | 跨表 `=SUMIFS(原始数据表!$J$2:$J$32, 原始数据表!$G$2:$G$32, D2)`，预期 66200 |
 | T19 | 实景 | `在动态数据统计图表的B5按订单编号查客户名称` | `=IFERROR(VLOOKUP($B$3, 原始数据表!$A$2:$M$32, 3, FALSE), "未找到订单")`，预期"王明"——查找区域含日期列也不阻断整式 |
 | T20 | 实景 | `把=SUM(saledata)这类定义名称公式拿去校验` | 校验阶段提示"无法识别的标识符"；本地试算标"未验证（不支持定义名称）"，不阻断流程 |
+| T21 | 正常 | `在J2用数组写法统计Math行大于85分的分数之和` | 生成 `=SUM((B2:F2>85)*B2:F2)`（或等价的 SUMPRODUCT 写法），预期结果 275；写入时含区域运算的公式自动转为数组公式（CSE）形态，Excel/WPS 打开与预览、网页显示一致 |
+| T22 | 正常 | `把=IFERROR(INDEX(成绩单!$B$2:$B$13,MATCH(LARGE(IF(成绩单!$C$2:$C$13="高一1班",成绩单!$G$2:$G$13),ROW()-15),IF(成绩单!$C$2:$C$13="高一1班",成绩单!$G$2:$G$13),0)),"")写进J16` | 含 ROW() 的条件排名公式本地可算（公式位置由目标单元格提供）：取高一1班总分第 1 名的姓名；写入时因 IF 数组形式自动 CSE 化，网页网格显示计算结果而非公式原文 |
 
 ## 现场演示脚本（约 1 分钟）
 
@@ -51,5 +53,7 @@ python main.py
 | T11 | `tests/test_pipeline.py::test_clarification_is_returned`、`test_missing_target_triggers_question` |
 | T12 / T13 | `tests/test_pipeline.py::test_path_outside_workspace_rejected`、`test_non_excel_suffix_rejected` |
 | T14 | `tests/test_pipeline.py::test_preview_does_not_touch_file` |
-| T17–T20 | `tests/test_homework_formulas.py`（29 个复刻用例）、`tests/test_homework_smoke.py`（真实文件 83 个公式对账）、`tests/test_pipeline.py::test_cross_sheet_sumifs_end_to_end` |
+| T17–T20 | `tests/test_homework_formulas.py`（31 个复刻用例）、`tests/test_homework_smoke.py`（真实文件 83 个公式对账）、`tests/test_pipeline.py::test_cross_sheet_sumifs_end_to_end` |
+| T21 | `tests/test_array_formulas.py`（判定器 / CSE 写入 / 网格显示）、`tests/test_homework_formulas.py::test_array_style_condition_broadcasts_elementwise` |
+| T22 | `tests/test_array_formulas.py`（ROW/COLUMN 位置上下文与条件排名公式）、`tests/test_pipeline.py::test_row_based_rank_formula_predicted_in_preview` |
 

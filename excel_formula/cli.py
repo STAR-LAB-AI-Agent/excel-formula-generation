@@ -14,7 +14,9 @@ from .evaluator import UnsupportedFormula
 from .formula_parser import FormulaSyntaxError
 from .intent import (
     INTENT_DESCRIBE,
+    INTENT_DROPDOWN,
     INTENT_EXPLAIN,
+    INTENT_FORMAT,
     INTENT_VALIDATE,
     classify,
     file_candidates,
@@ -109,14 +111,32 @@ def _confirm(prompt: str, assume_yes: bool) -> bool:
     return answer in {"y", "yes", "是"}
 
 
+def _fidelity_text(applied: dict) -> str:
+    """写入结果的富对象保真信息：丢失警告与保留清单（无富对象时返回空串）。"""
+    fidelity = applied.get("fidelity") or {}
+    lines = [f"⚠ {warning}" for warning in fidelity.get("warnings", [])]
+    if fidelity.get("preserved"):
+        lines.append("已保留: " + "、".join(fidelity["preserved"]))
+    return "".join(f"\n{line}" for line in lines)
+
+
 def _proposal_output(proposal: Proposal, applied: dict | None) -> tuple[dict, str]:
     payload = proposal.to_dict()
     payload["applied"] = applied
     text = proposal.render()
     if applied:
-        text += f"\n已写入 {applied['count']} 个单元格 → {applied['file']}"
+        if applied.get("count"):
+            text += f"\n已写入 {applied['count']} 个单元格 → {applied['file']}"
+        elif applied.get("dropdown"):
+            label = "规则已存在，文件未改动" if applied.get("unchanged") else "已设置下拉列表"
+            text += f"\n{label} → {applied['file']}"
+        else:
+            text += f"\n已套用表格格式（未改动单元格内容）→ {applied['file']}"
+        for label in applied.get("tables") or []:
+            text += f"\n表格格式: {label}"
         if applied.get("backup"):
             text += f"\n备份: {applied['backup']}"
+        text += _fidelity_text(applied)
     elif proposal.ok:
         text += "\n（预览模式，未写入。确认无误后加 --apply 执行）"
     text += "\nToken 用量: " + json.dumps(payload["usage"], ensure_ascii=False)
@@ -152,11 +172,30 @@ def _cmd_describe(service: FormulaService, args) -> int:
 
 
 def _cmd_generate(service: FormulaService, args) -> int:
-    proposal = service.propose(args.file, args.request, sheet=args.sheet, target=args.target)
+    # “新建一张表”的写法由本地规则识别：写入后自动给表头铺浅蓝底、整表加边框；
+    # “把范围框起来”则完全本地处理（0 Token），不调用模型
+    intent = classify(args.request)
+    if intent.kind == INTENT_DROPDOWN:
+        proposal = service.propose_dropdown(args.file, args.request, sheet=args.sheet)
+    elif intent.kind == INTENT_FORMAT:
+        proposal = service.frame_table(
+            args.file, sheet=args.sheet, cell_range=intent.table_range
+        )
+    else:
+        proposal = service.propose(
+            args.file, args.request, sheet=args.sheet, target=args.target,
+            new_table=intent.new_table,
+        )
     applied = None
     if proposal.ok and args.apply:
-        cells = ", ".join(w.cell for w in proposal.writes[:5])
-        if _confirm(f"确认把公式写入 {proposal.sheet}!{cells} ?", args.yes):
+        if intent.kind == INTENT_DROPDOWN:
+            prompt = f"确认给 {proposal.sheet}!{proposal.dropdown.cell_range} 设置下拉列表 ?"
+        elif intent.kind == INTENT_FORMAT:
+            prompt = f"确认给 {proposal.sheet}!{proposal.table.table_range} 加细边框 ?"
+        else:
+            cells = ", ".join(w.cell for w in proposal.writes[:5])
+            prompt = f"确认把公式写入 {proposal.sheet}!{cells} ?"
+        if _confirm(prompt, args.yes):
             applied = service.apply(proposal, output=args.output)
         else:
             payload, text = _proposal_output(proposal, None)
@@ -208,7 +247,8 @@ def _cmd_write(service: FormulaService, args) -> int:
         fill_to=args.fill_to,
         output=args.output,
     )
-    _emit(result, f"已写入 {result['count']} 个单元格 → {result['file']}", args.json)
+    text = f"已写入 {result['count']} 个单元格 → {result['file']}" + _fidelity_text(result)
+    _emit(result, text, args.json)
     return EXIT_OK
 
 

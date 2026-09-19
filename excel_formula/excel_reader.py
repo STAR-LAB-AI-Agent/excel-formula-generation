@@ -12,6 +12,7 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.formula import ArrayFormula
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .config import (
@@ -111,8 +112,10 @@ class WorkbookView:
         return self.wb_values[self.resolve_sheet(sheet)]
 
     def cell_formula(self, sheet: str | None, ref: str) -> str | None:
-        value = self.formula_sheet(sheet)[ref].value
-        return value if isinstance(value, str) and value.startswith("=") else None
+        cell = self.formula_sheet(sheet)[ref]
+        if cell.data_type != "f":
+            return None
+        return cell_formula_text(cell)
 
     def close(self) -> None:
         self.wb_formulas.close()
@@ -168,10 +171,11 @@ class WorkbookView:
             rows, cols = _effective_max_row(ws), _effective_max_col(ws)
             first_row: list[str] = []
             if rows and cols:
-                first_row = [
-                    _cell_text(ws.cell(row=1, column=c).value)
-                    for c in range(1, min(cols, 12) + 1)
-                ]
+                first_row = []
+                for c in range(1, min(cols, 12) + 1):
+                    cell = ws.cell(row=1, column=c)
+                    raw = cell_formula_text(cell) if cell.data_type == "f" else cell.value
+                    first_row.append(_cell_text(raw))
             result.append({"sheet": name, "rows": rows, "columns": cols, "first_row": first_row})
         return result
 
@@ -206,10 +210,19 @@ def _rows_to_keep(max_row: int, max_rows: int) -> list[int]:
 
 
 def _display_value(ws_f: Worksheet, ws_v: Worksheet, row: int, col: int):
-    """优先展示公式文本，其次展示缓存值。"""
-    raw = ws_f.cell(row=row, column=col).value
-    if isinstance(raw, str) and raw.startswith("="):
-        return raw
+    """优先展示公式文本，其次展示缓存值。
+
+    模拟运算表（数据表）单元格的值是 openpyxl 的 DataTableFormula 对象而非公式
+    文本；这类“对象型公式”退回 data_only 视图的缓存结果——Excel 里显示的就是
+    计算结果，也避免对象文本（如对象 repr）泄漏进摘要与网页网格。
+    """
+    cell = ws_f.cell(row=row, column=col)
+    if cell.data_type == "f":
+        text = cell_formula_text(cell)
+        if text is not None:
+            return text
+        return ws_v.cell(row=row, column=col).value
+    raw = cell.value
     cached = ws_v.cell(row=row, column=col).value
     return raw if cached is None else cached
 
@@ -227,3 +240,12 @@ def _cell_text(value: object, limit: int = DIGEST_MAX_CELL_TEXT) -> str:
         text = str(value)
     text = text.replace("\n", " ").replace("\t", " ").strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def cell_formula_text(cell) -> str | None:
+    """单元格里的字符串内容/公式文本：数组公式（CSE）取 .text，
+    其余字符串原样返回；对象型公式（模拟运算表等）返回 None。"""
+    raw = cell.value
+    if isinstance(raw, ArrayFormula):
+        return raw.text
+    return raw if isinstance(raw, str) else None

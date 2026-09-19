@@ -13,6 +13,7 @@ from excel_formula.llm_client import (
     build_generate_messages,
     build_repair_message,
     extract_candidates,
+    extract_table_spec,
     normalize_proxies,
     parse_json_payload,
 )
@@ -247,6 +248,31 @@ def test_extract_candidates_single_value_payload():
     assert items[0]["formula"] == ""
 
 
+def test_extract_table_spec_normalizes_coordinates():
+    """新建表格几何：去空格与 $、转大写；boolean 写法只带标记不带坐标。"""
+    assert extract_table_spec({"table": {"header": "a2:d2", "range": "$A$2:$D$10"}}) == {
+        "header": "A2:D2", "range": "A2:D10"
+    }
+    assert extract_table_spec({"table": True}) == {"header": None, "range": None}
+    assert extract_table_spec({"new_table": {"range": "a1 : c5"}}) == {
+        "header": None, "range": "A1:C5"
+    }
+
+
+def test_extract_table_spec_absent_or_empty():
+    assert extract_table_spec({"formulas": []}) is None
+    assert extract_table_spec({"table": None}) is None
+    assert extract_table_spec({"table": {"header": "", "range": ""}}) is None
+    assert extract_table_spec({"new_table": False}) is None
+
+
+def test_generation_prompt_hints_new_table_only_when_flagged():
+    messages = build_generate_messages("工作表: Sheet1", "新建一个汇总表", new_table=True)
+    assert "新建一张表格" in messages[1]["content"]
+    plain = build_generate_messages("工作表: Sheet1", "统计各科平均分")
+    assert "新建一张表格" not in plain[1]["content"]
+
+
 def test_repair_message_only_carries_formula_and_errors():
     digest_text = "工作表: Sheet1\n\tA\tB\n1\tSubject\tStudent1\n2\tMath\t85"
     messages = build_generate_messages(digest_text, "算总分", target="G2")
@@ -255,6 +281,22 @@ def test_repair_message_only_carries_formula_and_errors():
     assert "Student1" in messages[1]["content"]
     assert "Student1" not in repair["content"]  # 修复时不重发表格内容
     assert "循环引用" in repair["content"]
+
+
+def test_generation_prompt_distinguishes_target_and_sources():
+    messages = build_generate_messages(
+        "工作表: 班级信息", "计算三科平均分", target="D2",
+        sheet_names=["成绩单", "班级信息", "历史"],
+        source_digests={"成绩单": "工作表: 成绩单\n1\t学号\t姓名\t班级\t语文\t数学\t英语"},
+        omitted_sheets=["历史"],
+    )
+    context = messages[1]["content"]
+    assert "目标工作表（所有 target 均写入此表）" in context
+    assert "来源工作表（仅供引用）: 成绩单" in context
+    assert "因上下文预算未提供内容的工作表: 历史" in context
+    assert "目标单元格: D2" in context
+    assert "不得臆造" in messages[0]["content"]
+    assert "IFERROR(...,0)" in messages[0]["content"]
 
 
 # ------------------------------------------------------------------ 流式（SSE）

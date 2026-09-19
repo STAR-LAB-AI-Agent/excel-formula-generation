@@ -38,11 +38,21 @@ SYSTEM_PROMPT = """你是 Excel 公式专家，负责把中文自然语言需求
 11. explanation 用一句中文说明公式含义，不超过 60 字。
 12. 需求包含分类名、标题等已知常量时（例如新建汇总表要写入区域名、班级名、列标题），
     用 value 字段把这些常量直接写进单元格，不要留给用户手动填；也不要写成 ="华东" 这类“公式化的常量”。
+13. 目标表是写入位置，其他工作表内容仅供跨表引用。每个引用都须核对对应表的 TSV 列字母和数据区；
+    不得把目标表的列布局套到来源表，也不得臆造 A2:B100 等范围。空白的平均分列不是已有成绩。
+14. 表格可能因规模限制而省略部分行、列或工作表；缺少必要来源结构或统计口径不明确时，
+    返回 clarification，不得猜测列号。均分须明确科目范围、权重及空成绩处理，在 assumptions 中说明。
+15. 本地试算报告 #DIV/0!、#VALUE!、#N/A 等错误时，先核对真实数据与引用；
+    不得仅用 IFERROR(...,0) 掩盖引用错误。确实无数据且需求未说明处理方式时请求澄清。
+16. 需求是新建一张表（写表头行并填充数据）时，在 JSON 顶层加 table 字段给出几何：
+    {"header": "A2:D2", "range": "A2:D10"}。header 是表头行、必须是 range 的第一行，
+    标题、说明行不要写进 range。写入工具会据此给表头铺浅蓝底、给整表范围加边框。
+    仅给已有表增加一列/一行时不要给 table（输出 null 或省略）。
 
-输出 JSON 结构：
+输出 JSON 结构（table 仅新建表格时给出）：
 {"formulas": [{"target": "G2", "formula": "=SUM(B2:F2)", "explanation": "求B2到F2的总分",
 "fill_to": "G6"}, {"target": "A24", "value": "华东", "explanation": "区域名称"}],
-"assumptions": ["..."], "clarification": null}
+"table": {"header": "A24:D24", "range": "A24:D28"}, "assumptions": ["..."], "clarification": null}
 
 每个元素 formula 与 value 二选一：formula 为以 = 开头的公式；value 为直接写入的文本或数字。
 fill_to 可选：需要整列向下填充时给出结束单元格，公式会按相对引用自动调整（value 不支持 fill_to，多个常量逐个列出）。"""
@@ -50,6 +60,30 @@ fill_to 可选：需要整列向下填充时给出结束单元格，公式会按
 EXPLAIN_PROMPT = """你是 Excel 公式讲解者。用中文解释给定公式：先一句话说明作用，
 再分点说明关键部分（函数、引用区域、判断条件），最后指出常见易错点。总长度不超过 200 字，
 不要输出 Markdown 标题，不要复述表格全部数据。"""
+
+DROPDOWN_PROMPT = """你是 Excel 下拉列表（数据验证）助手。本地规则没能从用户原句解析出设置指令，
+请读懂原句并给出结构化参数。
+
+规则：
+1. 只输出 JSON，不要任何解释文字或 Markdown 代码块。
+2. 先判断 intent：创建/设置下拉列表为 "create"；删除、解释、询问或与下拉无关为 "remove"、
+   "query" 或 "other"，并在 clarification 里说明本系统只支持创建下拉列表。
+3. intent 为 "create" 时给出三部分：
+   - target：目标单元格或区域（如 "B3"、"C2:C13"），必须是需求里明确提到的位置；
+   - sheet：目标工作表名；只有需求把表名明确连到目标单元格（如“订单查询的B3”“在订单查询里给B3设置…”）
+     才填写，照抄表名；表名只是数据来源（如“选项用销售订单的订单号”）时必须留空，使用默认工作表；
+   - 来源三选一：{"source": {"sheet": "表名", "range": "A2:A25"}} 引用某表的区域；
+     {"source": {"sheet": "表名", "header": "列标题"}} 引用某个列标题对应列的数据；
+     {"options": ["甲", "乙"]} 使用需求里直接列举的选项。
+4. 表名与列标题必须真实存在于给出的表格内容中，不得凭空发明；用户的口语说法
+   （如“订单编号”）要映射到表格里实际的列标题（如“订单号”）。
+5. 无法确定 target 或来源时，把问题写进 clarification 并省略不确定的字段，不要猜测。
+6. 只支持静态区域、列标题或固定选项；不要输出公式、名称或 INDIRECT 等动态来源。
+
+输出 JSON 结构（不需要的字段用 null 或省略）：
+{"intent": "create", "sheet": "订单查询", "target": "B3",
+ "source": {"sheet": "销售订单", "header": "订单号", "range": null},
+ "options": null, "clarification": null}"""
 
 
 class LLMError(RuntimeError):
@@ -385,12 +419,28 @@ def build_generate_messages(
     *,
     target: str | None = None,
     sheet_names: list[str] | None = None,
+    source_digests: dict[str, str] | None = None,
+    omitted_sheets: list[str] | None = None,
+    new_table: bool = False,
 ) -> list[dict]:
-    parts = [f"表格内容:\n{digest_text}"]
+    parts = [f"目标工作表（所有 target 均写入此表）\n表格内容:\n{digest_text}"]
     if sheet_names and len(sheet_names) > 1:
         parts.append("工作簿内的工作表: " + ", ".join(sheet_names))
+    for name, text in (source_digests or {}).items():
+        parts.append(f"来源工作表（仅供引用）: {name}\n{text}")
+    if omitted_sheets:
+        parts.append(
+            "因上下文预算未提供内容的工作表: " + ", ".join(omitted_sheets)
+            + "。若需求依赖这些表且现有信息不足，请返回 clarification，不要猜测列号。"
+        )
     parts.append(f"目标单元格: {target}" if target else "目标单元格: 未指定，请自行选择并说明理由")
     parts.append(f"用户需求: {request}")
+    if new_table:
+        # 本地规则已识别出“新建表格”，明确提醒模型按规则给出 table 几何
+        parts.append(
+            "注意：这条需求是在新建一张表格，请按规则在 JSON 顶层给出 table 字段"
+            "（表头 header 与整表 range，header 是 range 的第一行）。"
+        )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": "\n".join(parts)},
@@ -418,6 +468,26 @@ def build_explain_messages(formula: str, digest_text: str | None = None) -> list
     return [
         {"role": "system", "content": EXPLAIN_PROMPT},
         {"role": "user", "content": user},
+    ]
+
+
+def build_dropdown_messages(
+    context_text: str,
+    request: str,
+    *,
+    default: str | None = None,
+    sheet_names: list[str] | None = None,
+) -> list[dict]:
+    """下拉兜底理解的上下文：目标表与来源表的 TSV，附上用户原句。"""
+    parts = [f"工作簿内容:\n{context_text}"]
+    if sheet_names:
+        parts.append("工作表列表: " + ", ".join(sheet_names))
+    if default:
+        parts.append(f"默认工作表（需求未指定目标表时使用）: {default}")
+    parts.append(f"用户需求: {request}")
+    return [
+        {"role": "system", "content": DROPDOWN_PROMPT},
+        {"role": "user", "content": "\n".join(parts)},
     ]
 
 
@@ -482,3 +552,79 @@ def extract_candidates(data: dict) -> tuple[list[dict], list[str], str | None]:
     clarification = data.get("clarification")
     clarification = str(clarification).strip() if clarification else None
     return items, assumptions, clarification
+
+
+def _clean_range_text(value: object) -> str | None:
+    """清洗模型给出的坐标文本：去空格与 $、转大写；空值返回 None。"""
+    text = re.sub(r"[\s$]", "", str(value or "")).upper()
+    return text or None
+
+
+def extract_table_spec(data: dict) -> dict | None:
+    """提取“新建表格”标记与几何，返回 {"header": str|None, "range": str|None}。
+
+    兼容三种写法：table 为对象（推荐，给出表头行与整表范围）、table 为 true（仅标记）、
+    顶层 new_table 字段。坐标只做清洗，合法性（越界、与写入不匹配等）由 pipeline 校验。
+    未标记新建表格时返回 None。
+    """
+    raw = data.get("table")
+    if raw is None:
+        raw = data.get("new_table")
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        return {"header": None, "range": None}
+    if isinstance(raw, dict):
+        header = _clean_range_text(raw.get("header"))
+        table_range = _clean_range_text(raw.get("range"))
+        if header is None and table_range is None:
+            return None
+        return {"header": header, "range": table_range}
+    return None
+
+
+def extract_dropdown_spec(data: dict) -> dict | None:
+    """从模型输出中提取下拉创建参数；只接受 intent 明确为 "create" 的结果。
+
+    返回 {"sheet": str|None, "target": str, "source": str|None, "options": list|None,
+    "source_sheet": str|None}：source 会拼成“表名的列标题”或“表名!区域”表达式，
+    表、列、区域的真实性仍由 data_validation 的严格校验把关，这里只做形态清洗与二选一取舍；
+    source_sheet 供兜底流程识别“模型把来源表填进 sheet”的情况。
+    """
+    if str(data.get("intent") or "").strip().lower() != "create":
+        return None
+    target = _clean_range_text(data.get("target")) or ""
+    target = re.sub(r"(?:到|至)", ":", target)
+    if not target:
+        return None
+    sheet = str(data.get("sheet") or "").strip() or None
+    options: list[str] | None = None
+    raw_options = data.get("options")
+    if isinstance(raw_options, list):
+        cleaned = [str(item).strip() for item in raw_options
+                   if item is not None and str(item).strip()]
+        options = cleaned or None
+    source_text: str | None = None
+    source_sheet: str | None = None
+    raw_source = data.get("source")
+    if isinstance(raw_source, dict):
+        src_sheet = str(raw_source.get("sheet") or "").strip()
+        source_sheet = src_sheet or None
+        header = re.sub(r"[\s　]+", "", str(raw_source.get("header") or ""))
+        area = _clean_range_text(raw_source.get("range"))
+        if src_sheet and header:
+            source_text = f"{src_sheet}的{header}"
+        elif src_sheet and area:
+            source_text = f"{src_sheet}!{area}"
+        elif area:
+            source_text = area
+        elif src_sheet:
+            source_text = src_sheet
+    elif isinstance(raw_source, str) and raw_source.strip():
+        source_text = raw_source.strip()
+    if source_text is None and options is None:
+        return None
+    if source_text is not None:
+        options = None  # 同时给出时优先区域/列标题来源：它能被本地严格校验
+    return {"sheet": sheet, "target": target, "source": source_text,
+            "options": options, "source_sheet": source_sheet}

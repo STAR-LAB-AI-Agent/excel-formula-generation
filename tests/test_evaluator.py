@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from excel_formula.evaluator import UnsupportedFormula, evaluate_formula, format_value
+from excel_formula.evaluator import ExcelError, UnsupportedFormula, evaluate_formula, format_value
 from excel_formula.excel_reader import WorkbookView
 from excel_formula.formula_parser import parse_formula
 
@@ -89,9 +89,34 @@ def test_division_by_zero_returns_excel_error(sample_xlsx):
     assert format_value(_eval(sample_xlsx, "=B2/(B2-B2)")) == "#DIV/0!"
 
 
+@pytest.mark.parametrize("data_type,is_error", [("e", True), ("s", False)])
+def test_cell_error_type_is_distinct_from_text(sample_xlsx, data_type, is_error):
+    with WorkbookView(sample_xlsx) as view:
+        ws = view.value_sheet("Sheet1")
+        ws["G2"] = "#DIV/0!"
+        ws["G2"].data_type = data_type
+        value = evaluate_formula(parse_formula("=G2"), {"Sheet1": ws}, "Sheet1")
+    assert isinstance(value, ExcelError) is is_error
+    assert format_value(value) == "#DIV/0!"
+
+
+def test_formula_view_distinguishes_missing_cache_from_blank(sample_xlsx):
+    with WorkbookView(sample_xlsx) as view:
+        formulas = view.formula_sheet("Sheet1")
+        values = view.value_sheet("Sheet1")
+        formulas["G2"] = "=2"
+        with pytest.raises(UnsupportedFormula, match="尚未计算"):
+            evaluate_formula(parse_formula("=1/G2"), {"Sheet1": values}, "Sheet1",
+                             formula_sheets={"Sheet1": formulas})
+        assert format_value(evaluate_formula(
+            parse_formula("=1/H2"), {"Sheet1": values}, "Sheet1",
+            formula_sheets={"Sheet1": formulas},
+        )) == "#DIV/0!"
+
+
 def test_unsupported_function_raises(sample_xlsx):
     with pytest.raises(UnsupportedFormula):
-        _eval(sample_xlsx, "=NETWORKDAYS(A2,A3)")
+        _eval(sample_xlsx, "=SUBTOTAL(9,B2:B6)")
 
 
 def test_reverse_lookup_with_array_constant(tmp_path):
@@ -125,3 +150,92 @@ def test_array_constant_literal_shapes(sample_xlsx):
     """数组常量本身可以参与求和，分号分行、逗号分列。"""
     assert format_value(_eval(sample_xlsx, "=SUM({1,2,3})")) == "6"
     assert format_value(_eval(sample_xlsx, "=COUNT({1,2;3,4})")) == "4"
+
+
+# ------------------------------------------------------------------ 数组运算
+@pytest.mark.parametrize(
+    "formula,expected",
+    [
+        # 区域与标量比较得到布尔数组，再乘回区域汇总（SUMPRODUCT 条件写法的基础）
+        ("=SUM((B2:F2>85)*B2:F2)", "275"),  # 92+88+95
+        ('=SUMPRODUCT((A2:A6="Math")*B2:B6)', "85"),
+        # 布尔数组直接求和：TRUE 计 1
+        ("=SUM((B2:F2>90)*1)", "2"),
+        # 同形区域逐元素相减后再汇总
+        ("=SUM(B2:F2-B3:F3)", "2"),  # -3-7+1+6+5
+        # 行区域 × 列区域按 Excel 广播成外积：总和 = 行合计 × 列合计
+        ("=SUM(B2:F2*B3:B6)", "147168"),  # 438 × 336
+        # 区域一元运算
+        ("=SUM(-B2:F2)", "-438"),
+        ("=SUM(B2:F2%)", "4.38"),
+    ],
+)
+def test_array_operands_broadcast_elementwise(sample_xlsx, formula, expected):
+    assert format_value(_eval(sample_xlsx, formula)) == expected
+
+
+def test_array_shape_mismatch_returns_na(sample_xlsx):
+    """维度不兼容（5 行比 3 行）无从广播：给 #N/A，不静默钳制出错误结果。"""
+    assert format_value(_eval(sample_xlsx, "=SUM(B2:B6*B2:B4)")) == "#N/A"
+
+
+def test_array_op_keeps_element_errors(sample_xlsx):
+    """区域里的错误值按位置保留为错误元素：不抛异常，也不吞成静默值。"""
+    with WorkbookView(sample_xlsx) as view:
+        ws = view.value_sheet("Sheet1")
+        ws["G2"] = "#DIV/0!"
+        ws["G2"].data_type = "e"
+        result = evaluate_formula(parse_formula("=B2:F2*G2:G2"), {"Sheet1": ws}, "Sheet1")
+    assert format_value(result) == "#DIV/0!"  # 顶层取左上角元素（隐式交叉近似）
+
+
+# ---------------------------------------------------------------- 展示级递归求值
+def test_expand_uncached_resolves_formula_chain(sample_xlsx):
+    """展示场景（expand_uncached）：主簿里没有缓存的公式也递归求值，链式依赖同样能算出来。"""
+    with WorkbookView(sample_xlsx) as view:
+        formulas = view.formula_sheet("Sheet1")
+        values = view.value_sheet("Sheet1")
+        formulas["G2"] = "=2"
+        formulas["G3"] = "=G2*10"  # 依赖上一层公式，两层都没有缓存
+        result = evaluate_formula(
+            parse_formula("=G3+1"), {"Sheet1": values}, "Sheet1",
+            formula_sheets={"Sheet1": formulas}, expand_uncached=True,
+        )
+    assert format_value(result) == "21"
+
+
+def test_expand_uncached_detects_cycle(sample_xlsx):
+    with WorkbookView(sample_xlsx) as view:
+        formulas = view.formula_sheet("Sheet1")
+        values = view.value_sheet("Sheet1")
+        formulas["G2"] = "=G3+1"
+        formulas["G3"] = "=G2+1"
+        with pytest.raises(UnsupportedFormula, match="循环引用"):
+            evaluate_formula(
+                parse_formula("=G2+1"), {"Sheet1": values}, "Sheet1",
+                formula_sheets={"Sheet1": formulas}, expand_uncached=True,
+            )
+
+
+def test_expand_uncached_reuses_dependency_result(sample_xlsx, monkeypatch):
+    """同一格被引用多次：递归求值只做一次，后续命中缓存。"""
+    import excel_formula.evaluator as evaluator_module
+
+    parsed_texts: list[str] = []
+    original = evaluator_module.parse_formula
+
+    def counting_parse(text):
+        parsed_texts.append(text)
+        return original(text)
+
+    monkeypatch.setattr(evaluator_module, "parse_formula", counting_parse)
+    with WorkbookView(sample_xlsx) as view:
+        formulas = view.formula_sheet("Sheet1")
+        values = view.value_sheet("Sheet1")
+        formulas["G2"] = "=2"
+        result = evaluate_formula(
+            parse_formula("=G2+G2+G2"), {"Sheet1": values}, "Sheet1",
+            formula_sheets={"Sheet1": formulas}, expand_uncached=True,
+        )
+    assert format_value(result) == "6"
+    assert parsed_texts.count("=2") == 1
